@@ -8,6 +8,7 @@ from arx.api import (
     attorney,
     audit,
     daily_brief,
+    data_portability,
     deals,
     equity_waterfall,
     errors,
@@ -48,6 +49,7 @@ app.include_router(equity_waterfall.router)
 app.include_router(attorney.router)
 app.include_router(attorney.deals_router)
 app.include_router(lender_package.router)
+app.include_router(data_portability.router)
 
 
 @app.get("/healthz", tags=["ops"])
