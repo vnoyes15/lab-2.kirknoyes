@@ -37,15 +37,25 @@ from arx.agents.a13_capital_raise import A13ValidationError, run_a13
 from arx.agents.errors import AgentValidationError
 from arx.agents.model_client import ModelClient, model_client_dependency
 from arx.agents.notification_rules import (
+    accuracy_flag_threshold_notification,
     daily_send_limit_reached_notification,
     deal_advancement_blocked_notification,
+    error_on_active_deal_notification,
 )
+from arx.agents.portfolio_context import compute_post_acquisition_impact
 from arx.api.auth import CurrentUser, require_role
 from arx.api.deps import claims_for
 from arx.db.connection import db_session
 from arx.db.queries.cost_controls import check_budget, increment_token_usage
+from arx.db.queries.portfolio import get_portfolio_aggregates
 from arx.db.queries.quality_log import record_agent_run, record_error
-from arx.db.queries.snapshots import activate_snapshot, get_active_snapshot, write_snapshot
+from arx.db.queries.snapshots import (
+    activate_snapshot,
+    count_recent_inaccurate_flags,
+    get_active_snapshot,
+    set_accuracy_flag,
+    write_snapshot,
+)
 from arx.notifications.channels import InAppChannel
 
 router = APIRouter(prefix="/api/v1/deals", tags=["agents"])
@@ -82,6 +92,7 @@ def _enforce_budget_or_raise(conn, org_id: str) -> None:
 
 def _handle_agent_failure(
     conn, *, org_id: str, deal_id: str, agent_id: str, exc: AgentValidationError,
+    deal_status: str, property_address: str,
 ) -> HTTPException:
     error_id = record_error(
         conn, org_id=org_id, deal_id=deal_id, error_type="validation_failure",
@@ -92,6 +103,17 @@ def _handle_agent_failure(
         conn, org_id=org_id, deal_id=deal_id, agent_id=agent_id, prompt_version=None,
         confidence_score=None, validation_passed=False, failed_checks=exc.failed_checks, token_count=None,
     )
+    # Section 78 EP1: "Admin notified immediately for errors on deals in active stages."
+    # Broadcast (recipient_user_id=None), same pattern as accuracy_flag_threshold and
+    # daily_send_limit_reached — there's no per-org "who is the Admin" lookup, so any
+    # notification meant for Admin's attention goes out org-wide rather than being
+    # silently dropped for lack of a specific recipient.
+    spec = error_on_active_deal_notification(
+        property_address=property_address, error_type="validation_failure",
+        agent_id=agent_id, deal_status=deal_status,
+    )
+    if spec is not None:
+        InAppChannel().send(conn, org_id=org_id, spec=spec, deal_id=deal_id)
     return HTTPException(
         status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
         detail={"message": str(exc), "error_id": error_id, "failed_checks": exc.failed_checks},
@@ -140,7 +162,10 @@ def invoke_a01(
             )
         except A01ValidationError as exc:
             with conn.transaction():
-                http_exc = _handle_agent_failure(conn, org_id=user.org_id, deal_id=deal_id, agent_id="a01", exc=exc)
+                http_exc = _handle_agent_failure(
+                    conn, org_id=user.org_id, deal_id=deal_id, agent_id="a01", exc=exc,
+                    deal_status=deal["status"], property_address=deal["property_address"],
+                )
             raise http_exc
 
         with conn.transaction():
@@ -212,7 +237,10 @@ def invoke_a02(
             )
         except A02ValidationError as exc:
             with conn.transaction():
-                http_exc = _handle_agent_failure(conn, org_id=user.org_id, deal_id=deal_id, agent_id="a02", exc=exc)
+                http_exc = _handle_agent_failure(
+                    conn, org_id=user.org_id, deal_id=deal_id, agent_id="a02", exc=exc,
+                    deal_status=deal["status"], property_address=deal["property_address"],
+                )
             raise http_exc
 
         with conn.transaction():
@@ -228,7 +256,25 @@ def invoke_a02(
             )
             increment_token_usage(conn, user.org_id, result.input_tokens + result.output_tokens)
 
-    return {"snapshot_id": snapshot_id, "output": result.output.model_dump(), "validation": result.validation.to_dict()}
+        # Section 69: "When A-02 or A-11 runs, it queries the portfolio layer for
+        # current aggregate metrics... then calculates post-acquisition portfolio
+        # metrics and flags." Computed against every *other* owned asset — this deal
+        # isn't itself owned yet, so it's never double-counted in the "current" side.
+        current_aggregates = get_portfolio_aggregates(conn, user.org_id)
+        portfolio_context = compute_post_acquisition_impact(
+            current=current_aggregates,
+            proposed={
+                "value": result.output.purchase_price, "asset_type": deal["asset_type"] or "multifamily",
+                "submarket": deal["submarket"], "loan_amount": result.output.loan_amount,
+                "dscr": result.output.dscr, "annual_debt_service": result.output.annual_debt_service,
+                "equity": result.output.purchase_price * (1 - result.output.ltv),
+            },
+        )
+
+    return {
+        "snapshot_id": snapshot_id, "output": result.output.model_dump(), "validation": result.validation.to_dict(),
+        "portfolio_context": portfolio_context,
+    }
 
 
 # ------------------------------------------------------------------ snapshot activation ---
@@ -245,6 +291,45 @@ def activate_agent_snapshot(
         with conn.transaction():
             activate_snapshot(conn, deal_id=deal_id, agent_id=agent_id, snapshot_id=snapshot_id)
     return {"deal_id": deal_id, "agent_id": agent_id, "active_snapshot_id": snapshot_id}
+
+
+# ------------------------------------------------------------- output accuracy flagging ---
+
+class AccuracyFlagRequest(BaseModel):
+    accuracy_flag: Literal["accurate", "partial", "inaccurate"]
+    accuracy_note: str | None = None
+
+
+@router.patch("/{deal_id}/agents/{agent_id}/snapshots/{snapshot_id}/accuracy")
+def flag_snapshot_accuracy(
+    deal_id: str, agent_id: str, snapshot_id: str, payload: AccuracyFlagRequest,
+    user: CurrentUser = Depends(require_role("admin", "analyst")),
+):
+    """Section 35 — Output Accuracy Flagging. "Creates a defensible decision record —
+    evidence that every agent output was reviewed by a human professional before being
+    acted upon." 3 'inaccurate' flags on the same agent within 30 days -> Admin
+    notification recommending prompt review."""
+    with db_session(claims_for(user)) as conn:
+        with conn.transaction():
+            updated = set_accuracy_flag(
+                conn, snapshot_id=snapshot_id, accuracy_flag=payload.accuracy_flag,
+                accuracy_note=payload.accuracy_note,
+            )
+            if updated is None:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Snapshot not found")
+
+            if payload.accuracy_flag == "inaccurate":
+                recent_count = count_recent_inaccurate_flags(conn, org_id=user.org_id, agent_id=agent_id)
+                spec = accuracy_flag_threshold_notification(
+                    agent_id=agent_id, recent_inaccurate_count=recent_count,
+                )
+                if spec is not None:
+                    InAppChannel().send(conn, org_id=user.org_id, spec=spec, deal_id=deal_id)
+
+    return {
+        "snapshot_id": snapshot_id, "accuracy_flag": updated["accuracy_flag"],
+        "accuracy_note": updated["accuracy_note"],
+    }
 
 
 # --------------------------------------------------------------------------- A-07 ---
@@ -289,7 +374,10 @@ def invoke_a07(
             )
         except A07ValidationError as exc:
             with conn.transaction():
-                http_exc = _handle_agent_failure(conn, org_id=user.org_id, deal_id=deal_id, agent_id="a07", exc=exc)
+                http_exc = _handle_agent_failure(
+                    conn, org_id=user.org_id, deal_id=deal_id, agent_id="a07", exc=exc,
+                    deal_status=deal["status"], property_address=deal["property_address"],
+                )
             raise http_exc
 
         with conn.transaction():
@@ -341,7 +429,10 @@ async def upload_document(
                 result = run_a09(document_type=doc_type, filename=file.filename, document_text=document_text, model_client=model_client)
         except A09ValidationError as exc:
             with conn.transaction():
-                http_exc = _handle_agent_failure(conn, org_id=user.org_id, deal_id=deal_id, agent_id="a09", exc=exc)
+                http_exc = _handle_agent_failure(
+                    conn, org_id=user.org_id, deal_id=deal_id, agent_id="a09", exc=exc,
+                    deal_status=deal["status"], property_address=deal["property_address"],
+                )
             raise http_exc
 
         with conn.transaction():
@@ -421,7 +512,10 @@ def invoke_a03(
             )
         except A03ValidationError as exc:
             with conn.transaction():
-                http_exc = _handle_agent_failure(conn, org_id=user.org_id, deal_id=deal_id, agent_id="a03", exc=exc)
+                http_exc = _handle_agent_failure(
+                    conn, org_id=user.org_id, deal_id=deal_id, agent_id="a03", exc=exc,
+                    deal_status=deal["status"], property_address=deal["property_address"],
+                )
             raise http_exc
 
         with conn.transaction():
@@ -489,7 +583,10 @@ def invoke_a04(
             )
         except A04ValidationError as exc:
             with conn.transaction():
-                http_exc = _handle_agent_failure(conn, org_id=user.org_id, deal_id=deal_id, agent_id="a04", exc=exc)
+                http_exc = _handle_agent_failure(
+                    conn, org_id=user.org_id, deal_id=deal_id, agent_id="a04", exc=exc,
+                    deal_status=deal["status"], property_address=deal["property_address"],
+                )
             raise http_exc
 
         with conn.transaction():
@@ -547,7 +644,10 @@ def invoke_a05(
             )
         except A05ValidationError as exc:
             with conn.transaction():
-                http_exc = _handle_agent_failure(conn, org_id=user.org_id, deal_id=deal_id, agent_id="a05", exc=exc)
+                http_exc = _handle_agent_failure(
+                    conn, org_id=user.org_id, deal_id=deal_id, agent_id="a05", exc=exc,
+                    deal_status=deal["status"], property_address=deal["property_address"],
+                )
             raise http_exc
 
         with conn.transaction():
@@ -583,7 +683,7 @@ def invoke_a12(
     model_client: ModelClient = Depends(model_client_dependency),
 ):
     with db_session(claims_for(user)) as conn:
-        _get_deal(conn, deal_id)
+        deal = _get_deal(conn, deal_id)
         _enforce_budget_or_raise(conn, user.org_id)
 
         active_snapshot = get_active_snapshot(conn, deal_id=deal_id, agent_id="a02")
@@ -603,7 +703,10 @@ def invoke_a12(
             )
         except A12ValidationError as exc:
             with conn.transaction():
-                http_exc = _handle_agent_failure(conn, org_id=user.org_id, deal_id=deal_id, agent_id="a12", exc=exc)
+                http_exc = _handle_agent_failure(
+                    conn, org_id=user.org_id, deal_id=deal_id, agent_id="a12", exc=exc,
+                    deal_status=deal["status"], property_address=deal["property_address"],
+                )
             raise http_exc
 
         with conn.transaction():
@@ -670,7 +773,10 @@ def invoke_a13(
             )
         except A13ValidationError as exc:
             with conn.transaction():
-                http_exc = _handle_agent_failure(conn, org_id=user.org_id, deal_id=deal_id, agent_id="a13", exc=exc)
+                http_exc = _handle_agent_failure(
+                    conn, org_id=user.org_id, deal_id=deal_id, agent_id="a13", exc=exc,
+                    deal_status=deal["status"], property_address=deal["property_address"],
+                )
             raise http_exc
 
         with conn.transaction():
@@ -723,7 +829,10 @@ def invoke_a10(
             )
         except A10ValidationError as exc:
             with conn.transaction():
-                http_exc = _handle_agent_failure(conn, org_id=user.org_id, deal_id=deal_id, agent_id="a10", exc=exc)
+                http_exc = _handle_agent_failure(
+                    conn, org_id=user.org_id, deal_id=deal_id, agent_id="a10", exc=exc,
+                    deal_status=deal["status"], property_address=deal["property_address"],
+                )
             raise http_exc
 
         with conn.transaction():
@@ -760,7 +869,7 @@ def invoke_a11(
     model_client: ModelClient = Depends(model_client_dependency),
 ):
     with db_session(claims_for(user)) as conn:
-        _get_deal(conn, deal_id)
+        deal = _get_deal(conn, deal_id)
         _enforce_budget_or_raise(conn, user.org_id)
 
         dev_config = _get_active_uw_config(conn, user.org_id, "development")
@@ -776,7 +885,10 @@ def invoke_a11(
             )
         except A11ValidationError as exc:
             with conn.transaction():
-                http_exc = _handle_agent_failure(conn, org_id=user.org_id, deal_id=deal_id, agent_id="a11", exc=exc)
+                http_exc = _handle_agent_failure(
+                    conn, org_id=user.org_id, deal_id=deal_id, agent_id="a11", exc=exc,
+                    deal_status=deal["status"], property_address=deal["property_address"],
+                )
             raise http_exc
 
         with conn.transaction():
@@ -792,7 +904,22 @@ def invoke_a11(
             )
             increment_token_usage(conn, user.org_id, result.input_tokens + result.output_tokens)
 
-    return {"snapshot_id": snapshot_id, "output": result.output.model_dump(), "validation": result.validation.to_dict()}
+        # Section 69: same portfolio-impact calculation as A-02's, but A-11's output
+        # carries no loan_amount/dscr — a development deal contributes to value and
+        # geographic/asset-type concentration only, not the debt-service/DSCR side.
+        current_aggregates = get_portfolio_aggregates(conn, user.org_id)
+        portfolio_context = compute_post_acquisition_impact(
+            current=current_aggregates,
+            proposed={
+                "value": result.output.total_project_cost, "asset_type": payload.asset_type,
+                "submarket": deal["submarket"],
+            },
+        )
+
+    return {
+        "snapshot_id": snapshot_id, "output": result.output.model_dump(), "validation": result.validation.to_dict(),
+        "portfolio_context": portfolio_context,
+    }
 
 
 # --------------------------------------------------------------------------- A-06 ---
@@ -820,7 +947,10 @@ def invoke_a06(
             )
         except A06ValidationError as exc:
             with conn.transaction():
-                http_exc = _handle_agent_failure(conn, org_id=user.org_id, deal_id=deal_id, agent_id="a06", exc=exc)
+                http_exc = _handle_agent_failure(
+                    conn, org_id=user.org_id, deal_id=deal_id, agent_id="a06", exc=exc,
+                    deal_status=deal["status"], property_address=deal["property_address"],
+                )
             raise http_exc
 
         with conn.transaction():
@@ -942,7 +1072,10 @@ def invoke_a08(
             raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail={"message": str(exc), "error_id": error_id})
         except A08ValidationError as exc:
             with conn.transaction():
-                http_exc = _handle_agent_failure(conn, org_id=user.org_id, deal_id=deal_id, agent_id="a08", exc=exc)
+                http_exc = _handle_agent_failure(
+                    conn, org_id=user.org_id, deal_id=deal_id, agent_id="a08", exc=exc,
+                    deal_status=deal["status"], property_address=deal["property_address"],
+                )
             raise http_exc
 
         with conn.transaction():

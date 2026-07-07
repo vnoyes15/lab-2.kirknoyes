@@ -72,3 +72,33 @@ def get_active_snapshot(conn: psycopg.Connection, *, deal_id: str, agent_id: str
             (deal_id, agent_id),
         )
         return cur.fetchone()
+
+
+def set_accuracy_flag(
+    conn: psycopg.Connection, *, snapshot_id: str, accuracy_flag: str, accuracy_note: str | None,
+) -> dict | None:
+    """Section 35 — Output Accuracy Flagging. accuracy_flag/accuracy_note are the only
+    mutable fields on an otherwise-immutable deal_snapshots row (the DB trigger
+    arx_enforce_snapshot_immutability already permits exactly these two plus notes/
+    is_active — see arx/db/migrations/007_deal_snapshots.sql)."""
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            "update deal_snapshots set accuracy_flag = %s, accuracy_note = %s "
+            "where snapshot_id = %s returning *",
+            (accuracy_flag, accuracy_note, snapshot_id),
+        )
+        return cur.fetchone()
+
+
+def count_recent_inaccurate_flags(conn: psycopg.Connection, *, org_id: str, agent_id: str, days: int = 30) -> int:
+    """Section 35: '3 inaccurate flags on the same agent within 30 days triggers Admin
+    notification.' Counts by accuracy_note's set time isn't tracked separately from
+    created_at, so this uses created_at — a snapshot flagged inaccurate long after
+    creation would count against its creation date, not the flagging date; documented
+    limitation, not a fabricated precision the schema doesn't actually have."""
+    row = conn.execute(
+        "select count(*) from deal_snapshots where org_id = %s and agent_id = %s "
+        "and accuracy_flag = 'inaccurate' and created_at >= now() - make_interval(days => %s)",
+        (org_id, agent_id, days),
+    ).fetchone()
+    return row[0]

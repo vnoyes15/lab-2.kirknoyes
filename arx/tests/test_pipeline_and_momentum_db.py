@@ -124,7 +124,7 @@ def test_pipeline_view_orders_by_stage_then_momentum(client_and_token, org_id):
     lead_deal = _insert_deal(org_id, status="lead", property_address="Lead stage deal")
     dead_deal = _insert_deal(org_id, status="dead", property_address="Dead deal", close_reason_code="other")
 
-    resp = client.get("/api/v1/deals/pipeline", headers={"Authorization": f"Bearer {token}"})
+    resp = client.get("/api/v1/pipeline", headers={"Authorization": f"Bearer {token}"})
     assert resp.status_code == 200, resp.text
     body = resp.json()
 
@@ -140,5 +140,108 @@ def test_pipeline_view_orders_by_stage_then_momentum(client_and_token, org_id):
 
 def test_pipeline_view_requires_auth(client_and_token):
     client, _ = client_and_token
-    resp = client.get("/api/v1/deals/pipeline")
+    resp = client.get("/api/v1/pipeline")
     assert resp.status_code in (401, 403)
+
+
+def test_pipeline_view_status_filter_includes_dead(client_and_token, org_id):
+    client, token = client_and_token
+    dead_deal = _insert_deal(org_id, status="dead", property_address="Dead deal", close_reason_code="other")
+    lead_deal = _insert_deal(org_id, status="lead", property_address="Lead deal")
+
+    resp = client.get("/api/v1/pipeline?status=dead", headers={"Authorization": f"Bearer {token}"})
+    assert resp.status_code == 200, resp.text
+    deal_ids = [d["deal_id"] for d in resp.json()]
+    assert dead_deal in deal_ids
+    assert lead_deal not in deal_ids
+
+
+def test_pipeline_view_filters_by_deal_type_and_submarket(client_and_token, org_id):
+    client, token = client_and_token
+    conn = psycopg.connect(settings.database_url, autocommit=True)
+    land_deal = conn.execute(
+        "insert into deals (org_id, property_address, deal_type, status, submarket) "
+        "values (%s, 'Land parcel', 'land', 'lead', 'tacoma') returning deal_id",
+        (org_id,),
+    ).fetchone()[0]
+    conn.close()
+    acq_deal = _insert_deal(org_id, status="lead", property_address="Acquisition deal", submarket="seattle")
+
+    resp = client.get("/api/v1/pipeline?deal_type=land", headers={"Authorization": f"Bearer {token}"})
+    deal_ids = [d["deal_id"] for d in resp.json()]
+    assert str(land_deal) in deal_ids
+    assert acq_deal not in deal_ids
+
+    resp = client.get("/api/v1/pipeline?submarket=seattle", headers={"Authorization": f"Bearer {token}"})
+    deal_ids = [d["deal_id"] for d in resp.json()]
+    assert acq_deal in deal_ids
+    assert str(land_deal) not in deal_ids
+
+
+def test_pipeline_analytics_death_reasons_and_deal_type_breakdown(client_and_token, org_id):
+    client, token = client_and_token
+    _insert_deal(org_id, status="dead", property_address="Dead 1", close_reason_code="deal_failed_underwriting")
+    _insert_deal(org_id, status="dead", property_address="Dead 2", close_reason_code="deal_failed_underwriting")
+    _insert_deal(org_id, status="lead", property_address="Live deal")
+
+    resp = client.get("/api/v1/pipeline/analytics", headers={"Authorization": f"Bearer {token}"})
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["death_reason_distribution"]["deal_failed_underwriting"] == 2
+    assert body["deal_type_breakdown"]["acquisition"] == 3
+
+
+def test_pipeline_analytics_average_days_per_stage(client_and_token, org_id):
+    client, token = client_and_token
+    conn = psycopg.connect(settings.database_url, autocommit=True)
+    deal_id = conn.execute(
+        "insert into deals (org_id, property_address, deal_type, status) "
+        "values (%s, 'Stage timing deal', 'acquisition', 'screened') returning deal_id",
+        (org_id,),
+    ).fetchone()[0]
+    conn.execute(
+        "insert into deal_status_history (deal_id, org_id, status, entered_at, exited_at) "
+        "values (%s, %s, 'lead', now() - interval '5 days', now() - interval '2 days')",
+        (deal_id, org_id),
+    )
+    conn.close()
+
+    resp = client.get("/api/v1/pipeline/analytics", headers={"Authorization": f"Bearer {token}"})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["average_days_per_stage"]["lead"] == pytest.approx(3.0, abs=0.1)
+
+
+def test_deal_status_update_records_history(client_and_token, org_id):
+    client, token = client_and_token
+    lead_deal = _insert_deal(org_id, status="lead")
+    conn = psycopg.connect(settings.database_url, autocommit=True)
+    conn.execute(
+        "insert into deal_status_history (deal_id, org_id, status) values (%s, %s, 'lead')",
+        (lead_deal, org_id),
+    )
+    conn.close()
+
+    resp = client.patch(
+        f"/api/v1/deals/{lead_deal}/status",
+        headers={"Authorization": f"Bearer {token}"}, json={"status": "screened"},
+    )
+    assert resp.status_code == 200, resp.text
+
+    conn = psycopg.connect(settings.database_url, autocommit=True)
+    rows = conn.execute(
+        "select status, exited_at from deal_status_history where deal_id = %s order by entered_at", (lead_deal,)
+    ).fetchall()
+    conn.close()
+    assert rows[0][0] == "lead" and rows[0][1] is not None
+    assert rows[1][0] == "screened" and rows[1][1] is None
+
+
+def test_deal_status_update_dead_requires_close_reason(client_and_token, org_id):
+    client, token = client_and_token
+    lead_deal = _insert_deal(org_id, status="lead")
+
+    resp = client.patch(
+        f"/api/v1/deals/{lead_deal}/status",
+        headers={"Authorization": f"Bearer {token}"}, json={"status": "dead"},
+    )
+    assert resp.status_code == 422

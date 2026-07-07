@@ -3,7 +3,27 @@ middleware, API versioning. Section 01: API-first, no front end in Phase 1.
 """
 from fastapi import FastAPI
 
-from arx.api import agents, deals, notifications
+from arx.api import (
+    agents,
+    attorney,
+    audit,
+    daily_brief,
+    data_portability,
+    data_quality,
+    deals,
+    equity_waterfall,
+    errors,
+    lender_package,
+    lp,
+    market_signals,
+    network_intelligence,
+    notifications,
+    pipeline,
+    portfolio,
+    refi_disposition,
+    risk,
+    scenarios,
+)
 from arx.api.config import get_settings
 
 # Fail fast at import time if required env vars are missing (Section 86) — this must
@@ -19,6 +39,23 @@ app = FastAPI(
 app.include_router(deals.router)
 app.include_router(agents.router)
 app.include_router(notifications.router)
+app.include_router(pipeline.router)
+app.include_router(portfolio.router)
+app.include_router(lp.router)
+app.include_router(scenarios.router)
+app.include_router(audit.router)
+app.include_router(daily_brief.router)
+app.include_router(errors.router)
+app.include_router(risk.router)
+app.include_router(refi_disposition.router)
+app.include_router(equity_waterfall.router)
+app.include_router(attorney.router)
+app.include_router(attorney.deals_router)
+app.include_router(lender_package.router)
+app.include_router(data_portability.router)
+app.include_router(market_signals.router)
+app.include_router(network_intelligence.router)
+app.include_router(data_quality.router)
 
 
 @app.get("/healthz", tags=["ops"])

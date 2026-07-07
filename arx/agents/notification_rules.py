@@ -11,6 +11,16 @@ triggering fact the caller already has in hand.
 from dataclasses import dataclass, asdict
 
 MOMENTUM_STALLED_THRESHOLD = 20
+ACCURACY_FLAG_ADMIN_THRESHOLD = 3
+# Section 49: "Milestone delay notifications fire to LP users when schedule slips
+# beyond defined thresholds" — no exact day count is given in the spec; 14 days is a
+# ZONIQ operating-cadence assumption, same category as momentum_scoring.py's
+# documented thresholds.
+MILESTONE_DELAY_THRESHOLD_DAYS = 14
+# Section 45: "Variance above 10% triggers notification. Variance above 20% triggers
+# Admin escalation."
+PERFORMANCE_VARIANCE_NOTIFY_THRESHOLD = 0.10
+PERFORMANCE_VARIANCE_ADMIN_ESCALATION_THRESHOLD = 0.20
 
 
 @dataclass(frozen=True)
@@ -65,6 +75,140 @@ def momentum_stalled_notification(
                  f"no recent activity and/or stuck in its current status.",
         )
     return None
+
+
+def accuracy_flag_threshold_notification(*, agent_id: str, recent_inaccurate_count: int) -> NotificationSpec | None:
+    """Section 35: '3 inaccurate flags on the same agent within 30 days triggers Admin
+    notification recommending prompt review.' Fires every time the count is at or
+    above threshold (unlike momentum_stalled_notification's one-time transition alert)
+    — each new inaccurate flag past the threshold is itself new information an Admin
+    should see, not a repeat of the same alert."""
+    if recent_inaccurate_count < ACCURACY_FLAG_ADMIN_THRESHOLD:
+        return None
+    return NotificationSpec(
+        notification_type="accuracy_flag_threshold",
+        severity="critical",
+        title=f"Agent {agent_id}: {recent_inaccurate_count} inaccurate outputs flagged in 30 days",
+        body=f"Agent '{agent_id}' has been flagged 'inaccurate' {recent_inaccurate_count} times in the "
+             f"last 30 days (threshold: {ACCURACY_FLAG_ADMIN_THRESHOLD}). Recommend prompt review (Section 35).",
+        source_agent=agent_id,
+    )
+
+
+def milestone_delay_notification(
+    *, property_address: str, milestone_type: str, variance_days: int | None,
+) -> NotificationSpec | None:
+    """Fires when a development milestone's variance_days (actual_date - projected_date,
+    computed by the caller) exceeds MILESTONE_DELAY_THRESHOLD_DAYS. Recipients are the
+    deal's LP users specifically (Section 49), not the org broadly — the caller sends
+    one notification per deal_lp_access row rather than an org-wide one."""
+    if variance_days is None or variance_days <= MILESTONE_DELAY_THRESHOLD_DAYS:
+        return None
+    return NotificationSpec(
+        notification_type="milestone_delay",
+        severity="warning",
+        title=f"Milestone delayed: {property_address}",
+        body=f"'{milestone_type}' is running {variance_days} days behind schedule "
+             f"(threshold: {MILESTONE_DELAY_THRESHOLD_DAYS} days).",
+    )
+
+
+def task_assigned_notification(*, title: str, property_address: str, source_agent: str | None) -> NotificationSpec:
+    """Section 73: "Assigned users receive notification on task creation." Fires for
+    both agent-created tasks (A-06's DD checklist, source_agent='a06') and manually
+    created ones (source_agent=None)."""
+    return NotificationSpec(
+        notification_type="task_assigned",
+        severity="info",
+        title=f"New task assigned: {property_address}",
+        body=f'You\'ve been assigned a task: "{title}".',
+        source_agent=source_agent,
+    )
+
+
+def error_on_active_deal_notification(
+    *, property_address: str, error_type: str, agent_id: str | None, deal_status: str,
+) -> NotificationSpec | None:
+    """Section 78 EP1: "Admin notified immediately for errors on deals in active
+    stages." 'Active' here means not yet closed or dead — an error on a deal that's
+    already done doesn't need an urgent Admin ping."""
+    if deal_status in ("closed", "dead"):
+        return None
+    return NotificationSpec(
+        notification_type="error_on_active_deal",
+        severity="critical",
+        title=f"Agent error on active deal: {property_address}",
+        body=f"An unrecoverable error ({error_type}) occurred"
+             + (f" in agent '{agent_id}'" if agent_id else "") + f" while the deal was in '{deal_status}'.",
+        source_agent=agent_id,
+    )
+
+
+def performance_variance_notification(
+    *, property_address: str, actual_noi: float, projected_noi: float, variance_pct: float,
+) -> NotificationSpec | None:
+    """Section 45: actual NOI vs. the projected NOI from the active A-02 snapshot at
+    acquisition. Below the 10% threshold is normal operating noise, not worth a
+    notification. 10-20% is a regular notification; 20%+ escalates to Admin (severity
+    critical) — same two-tier shape as accuracy_flag_threshold_notification's
+    escalation, just on a different metric."""
+    if abs(variance_pct) < PERFORMANCE_VARIANCE_NOTIFY_THRESHOLD:
+        return None
+    severity = "critical" if abs(variance_pct) >= PERFORMANCE_VARIANCE_ADMIN_ESCALATION_THRESHOLD else "warning"
+    direction = "above" if variance_pct > 0 else "below"
+    return NotificationSpec(
+        notification_type="performance_variance", severity=severity,
+        title=f"NOI variance {'escalation' if severity == 'critical' else 'alert'}: {property_address}",
+        body=f"Actual NOI (${actual_noi:,.0f}) is {abs(variance_pct) * 100:.1f}% {direction} the projected "
+             f"NOI (${projected_noi:,.0f}) from the active A-02 snapshot.",
+    )
+
+
+def refi_opportunity_notification(
+    *, property_address: str, improvement_bps: float, cash_on_cash_improvement: float,
+) -> NotificationSpec:
+    """Section 46: "Refi trigger: when refi improves debt constant by 50bps+, surfaces
+    notification with projected cash-on-cash improvement." Caller only invokes this
+    once arx.agents.refi_disposition.analyze_refi has already confirmed the trigger —
+    same "no output without a concrete triggering fact" contract as every other
+    function in this module."""
+    return NotificationSpec(
+        notification_type="refi_opportunity", severity="info",
+        title=f"Refinance opportunity: {property_address}",
+        body=f"Refinancing would improve the debt constant by {improvement_bps:.0f}bps, projected to "
+             f"improve cash-on-cash return by {cash_on_cash_improvement * 100:.1f} percentage points.",
+    )
+
+
+def disposition_opportunity_notification(
+    *, property_address: str, appreciation_pct: float,
+) -> NotificationSpec:
+    """Section 46: "Disposition trigger: cap rate compression implies value
+    appreciation above return threshold." Caller only invokes this once
+    arx.agents.refi_disposition.analyze_disposition has already confirmed the
+    trigger."""
+    return NotificationSpec(
+        notification_type="disposition_opportunity", severity="info",
+        title=f"Disposition opportunity: {property_address}",
+        body=f"Cap rate compression implies {appreciation_pct * 100:.1f}% value appreciation since "
+             f"acquisition — consider a 1031 exchange window if disposition is being pursued.",
+    )
+
+
+def market_signal_deal_impact_notification(
+    *, property_address: str, signal_type: str, submarket: str, change_pct: float | None,
+) -> NotificationSpec:
+    """Section 62: "When a market_signals record is created with significance = high...
+    For each affected deal:... triggers deal risk monitor notification." Fires once
+    per affected deal, not once per signal — the caller iterates affected deals and
+    calls this per deal."""
+    change_note = f" ({change_pct * 100:+.1f}%)" if change_pct is not None else ""
+    return NotificationSpec(
+        notification_type="market_signal_deal_impact", severity="warning",
+        title=f"Market signal affects this deal: {property_address}",
+        body=f"A high-significance {signal_type} signal in {submarket}{change_note} may affect this deal's "
+             f"underwriting assumptions — worth a review.",
+    )
 
 
 def daily_send_limit_reached_notification(*, daily_send_limit: int) -> NotificationSpec:
