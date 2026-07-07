@@ -1,3 +1,4 @@
+import process from "node:process";
 import cors from "cors";
 import express from "express";
 import { addEntry, deleteEntry, readEntries } from "./store.js";
