@@ -42,10 +42,12 @@ from arx.agents.notification_rules import (
     deal_advancement_blocked_notification,
     error_on_active_deal_notification,
 )
+from arx.agents.portfolio_context import compute_post_acquisition_impact
 from arx.api.auth import CurrentUser, require_role
 from arx.api.deps import claims_for
 from arx.db.connection import db_session
 from arx.db.queries.cost_controls import check_budget, increment_token_usage
+from arx.db.queries.portfolio import get_portfolio_aggregates
 from arx.db.queries.quality_log import record_agent_run, record_error
 from arx.db.queries.snapshots import (
     activate_snapshot,
@@ -254,7 +256,25 @@ def invoke_a02(
             )
             increment_token_usage(conn, user.org_id, result.input_tokens + result.output_tokens)
 
-    return {"snapshot_id": snapshot_id, "output": result.output.model_dump(), "validation": result.validation.to_dict()}
+        # Section 69: "When A-02 or A-11 runs, it queries the portfolio layer for
+        # current aggregate metrics... then calculates post-acquisition portfolio
+        # metrics and flags." Computed against every *other* owned asset — this deal
+        # isn't itself owned yet, so it's never double-counted in the "current" side.
+        current_aggregates = get_portfolio_aggregates(conn, user.org_id)
+        portfolio_context = compute_post_acquisition_impact(
+            current=current_aggregates,
+            proposed={
+                "value": result.output.purchase_price, "asset_type": deal["asset_type"] or "multifamily",
+                "submarket": deal["submarket"], "loan_amount": result.output.loan_amount,
+                "dscr": result.output.dscr, "annual_debt_service": result.output.annual_debt_service,
+                "equity": result.output.purchase_price * (1 - result.output.ltv),
+            },
+        )
+
+    return {
+        "snapshot_id": snapshot_id, "output": result.output.model_dump(), "validation": result.validation.to_dict(),
+        "portfolio_context": portfolio_context,
+    }
 
 
 # ------------------------------------------------------------------ snapshot activation ---
@@ -884,7 +904,22 @@ def invoke_a11(
             )
             increment_token_usage(conn, user.org_id, result.input_tokens + result.output_tokens)
 
-    return {"snapshot_id": snapshot_id, "output": result.output.model_dump(), "validation": result.validation.to_dict()}
+        # Section 69: same portfolio-impact calculation as A-02's, but A-11's output
+        # carries no loan_amount/dscr — a development deal contributes to value and
+        # geographic/asset-type concentration only, not the debt-service/DSCR side.
+        current_aggregates = get_portfolio_aggregates(conn, user.org_id)
+        portfolio_context = compute_post_acquisition_impact(
+            current=current_aggregates,
+            proposed={
+                "value": result.output.total_project_cost, "asset_type": payload.asset_type,
+                "submarket": deal["submarket"],
+            },
+        )
+
+    return {
+        "snapshot_id": snapshot_id, "output": result.output.model_dump(), "validation": result.validation.to_dict(),
+        "portfolio_context": portfolio_context,
+    }
 
 
 # --------------------------------------------------------------------------- A-06 ---

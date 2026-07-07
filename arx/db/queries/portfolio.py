@@ -9,6 +9,7 @@ current ROC estimate."
 import psycopg
 from psycopg.rows import dict_row
 
+from arx.agents.portfolio_context import PortfolioAggregates, compute_portfolio_aggregates
 from arx.agents.portfolio_stress import (
     StressParams,
     stress_acquisition_asset,
@@ -197,3 +198,50 @@ def run_portfolio_stress_test(conn: psycopg.Connection, org_id: str, params: Str
         "cap_rate_expansion_bps": params.cap_rate_expansion_bps,
     }
     return summary
+
+
+def get_portfolio_aggregates(conn: psycopg.Connection, org_id: str) -> PortfolioAggregates:
+    """Section 69: the current-state half of "portfolio impact calculation in A-02 and
+    A-11" — gathers every owned asset's value/asset_type/submarket, plus loan_amount/
+    dscr/annual_debt_service/equity for the acquisition ones with an active A-02
+    snapshot, and reduces them via the pure arithmetic in
+    arx/agents/portfolio_context.py."""
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            "select deal_id, deal_type, asset_type, submarket, asking_price "
+            "from deals where org_id = %s and is_acquired = true",
+            (org_id,),
+        )
+        deals = cur.fetchall()
+
+        owned_assets = []
+        for deal in deals:
+            asset = {"asset_type": deal["asset_type"] or deal["deal_type"], "submarket": deal["submarket"]}
+            if deal["deal_type"] == "acquisition":
+                cur.execute(
+                    "select output_payload from deal_snapshots "
+                    "where deal_id = %s and agent_id = 'a02' and is_active = true",
+                    (deal["deal_id"],),
+                )
+                snapshot = cur.fetchone()
+                if snapshot is None:
+                    continue
+                payload = snapshot["output_payload"]
+                asset["value"] = payload["purchase_price"]
+                asset["loan_amount"] = payload["loan_amount"]
+                asset["dscr"] = payload["dscr"]
+                asset["annual_debt_service"] = payload["annual_debt_service"]
+                asset["equity"] = payload["purchase_price"] * (1 - payload["ltv"])
+            else:
+                cur.execute(
+                    "select output_payload from deal_snapshots "
+                    "where deal_id = %s and agent_id = 'a11' and is_active = true",
+                    (deal["deal_id"],),
+                )
+                snapshot = cur.fetchone()
+                if snapshot is None:
+                    continue
+                asset["value"] = snapshot["output_payload"]["total_project_cost"]
+            owned_assets.append(asset)
+
+    return compute_portfolio_aggregates(owned_assets)
