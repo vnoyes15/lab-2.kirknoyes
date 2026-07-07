@@ -124,6 +124,85 @@ def test_portfolio_summary_aggregates_owned_assets(client_and_token, org_id):
     assert body["total_latest_monthly_noi"] == 30000
 
 
+def _activate_a02_snapshot(org_id: str, deal_id: str, **overrides):
+    fields = {
+        "gross_rent": 500_000, "vacancy_rate": 0.07,
+        "operating_expenses": {"management": 40_000, "maintenance": 25_000, "capex_reserves": 25_000,
+                                "insurance": 25_000, "taxes": 40_000, "other": 10_000},
+        "noi": 300_000, "cap_rate": 0.06, "purchase_price": 5_000_000,
+        "loan_amount": 3_750_000, "ltv": 0.75, "interest_rate": 0.065, "amortization_years": 30,
+        "dscr": 1.35, "cash_on_cash": 0.08,
+    }
+    fields.update(overrides)
+    import json
+    conn = psycopg.connect(settings.database_url, autocommit=True)
+    conn.execute(
+        "insert into deal_snapshots (deal_id, org_id, agent_id, version_number, is_active, "
+        "input_payload, output_payload) values (%s, %s, 'a02', 1, true, '{}'::jsonb, %s::jsonb)",
+        (deal_id, org_id, json.dumps(fields)),
+    )
+    conn.close()
+
+
+def _activate_a11_snapshot(org_id: str, deal_id: str, **overrides):
+    fields = {"stabilized_noi": 400_000, "return_on_cost": 0.075, "exit_cap_rate": 0.06}
+    fields.update(overrides)
+    import json
+    conn = psycopg.connect(settings.database_url, autocommit=True)
+    conn.execute(
+        "insert into deal_snapshots (deal_id, org_id, agent_id, version_number, is_active, "
+        "input_payload, output_payload) values (%s, %s, 'a11', 1, true, '{}'::jsonb, %s::jsonb)",
+        (deal_id, org_id, json.dumps(fields)),
+    )
+    conn.close()
+
+
+def test_stress_test_computes_dscr_for_acquisition_asset(client_and_token, org_id):
+    client, token = client_and_token
+    deal_id = _insert_deal(org_id, property_address="Stressed Acquisition")
+    _activate_a02_snapshot(org_id, deal_id)
+
+    resp = client.post(
+        "/api/v1/portfolio/stress-test", headers={"Authorization": f"Bearer {token}"},
+        json={"vacancy_shock_bps": 200, "interest_rate_shock_bps": 100, "cap_rate_expansion_bps": 100},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    asset = next(a for a in body["assets"] if a["deal_id"] == deal_id)
+    assert asset["asset_type"] == "acquisition"
+    assert asset["stressed_dscr"] < asset["original_dscr"]
+    assert asset["stressed_noi"] < asset["original_noi"]
+
+
+def test_stress_test_development_asset_has_no_dscr(client_and_token, org_id):
+    client, token = client_and_token
+    deal_id = _insert_deal(
+        org_id, property_address="Dev Under Construction", deal_type="development", status="construction",
+    )
+    _activate_a11_snapshot(org_id, deal_id)
+
+    resp = client.post(
+        "/api/v1/portfolio/stress-test", headers={"Authorization": f"Bearer {token}"},
+        json={"cap_rate_expansion_bps": 100},
+    )
+    assert resp.status_code == 200, resp.text
+    asset = next(a for a in resp.json()["assets"] if a["deal_id"] == deal_id)
+    assert asset["asset_type"] == "development"
+    assert asset["stressed_dscr"] is None
+    assert asset["stressed_value"] < asset["original_value"]
+
+
+def test_stress_test_skips_owned_deal_with_no_active_snapshot(client_and_token, org_id):
+    client, token = client_and_token
+    _insert_deal(org_id, property_address="No Snapshot Yet")
+
+    resp = client.post(
+        "/api/v1/portfolio/stress-test", headers={"Authorization": f"Bearer {token}"}, json={},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["asset_count"] == 0
+
+
 def test_development_pipeline_includes_milestones_and_budget_variance(client_and_token, org_id):
     client, token = client_and_token
     deal_id = _insert_deal(

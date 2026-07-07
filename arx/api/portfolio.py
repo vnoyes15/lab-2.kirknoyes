@@ -8,6 +8,7 @@ from psycopg.rows import dict_row
 from pydantic import BaseModel
 
 from arx.agents.notification_rules import milestone_delay_notification
+from arx.agents.portfolio_stress import StressParams
 from arx.api.auth import CurrentUser, require_role
 from arx.api.deps import claims_for
 from arx.db.connection import db_session
@@ -16,6 +17,7 @@ from arx.db.queries.portfolio import (
     get_portfolio_summary,
     list_deal_performance,
     record_deal_performance,
+    run_portfolio_stress_test,
 )
 from arx.notifications.channels import InAppChannel
 
@@ -80,6 +82,31 @@ def portfolio_development_pipeline(
 ) -> list[dict]:
     with db_session(claims_for(user)) as conn:
         return get_development_pipeline(conn, user.org_id)
+
+
+class StressTestRequest(BaseModel):
+    # Section 47's named levers, each independently toggleable so a caller can isolate
+    # one factor or run all three together ("or combined").
+    interest_rate_shock_bps: float = 100
+    vacancy_shock_bps: float = 200
+    cap_rate_expansion_bps: float = 100
+    apply_rate_shock: bool = True
+    apply_vacancy_shock: bool = True
+    apply_cap_rate_expansion: bool = True
+
+
+@router.post("/portfolio/stress-test")
+def portfolio_stress_test(
+    payload: StressTestRequest,
+    user: CurrentUser = Depends(require_role("admin", "analyst", "viewer")),
+) -> dict:
+    params = StressParams(
+        interest_rate_shock_bps=payload.interest_rate_shock_bps if payload.apply_rate_shock else 0.0,
+        vacancy_shock_bps=payload.vacancy_shock_bps if payload.apply_vacancy_shock else 0.0,
+        cap_rate_expansion_bps=payload.cap_rate_expansion_bps if payload.apply_cap_rate_expansion else 0.0,
+    )
+    with db_session(claims_for(user)) as conn:
+        return run_portfolio_stress_test(conn, user.org_id, params)
 
 
 class MilestoneUpdateRequest(BaseModel):

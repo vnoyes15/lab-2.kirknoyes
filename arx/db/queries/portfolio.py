@@ -9,6 +9,13 @@ current ROC estimate."
 import psycopg
 from psycopg.rows import dict_row
 
+from arx.agents.portfolio_stress import (
+    StressParams,
+    stress_acquisition_asset,
+    stress_development_asset,
+    summarize_portfolio_stress,
+)
+
 
 def record_deal_performance(
     conn: psycopg.Connection, *,
@@ -124,3 +131,55 @@ def get_development_pipeline(conn: psycopg.Connection, org_id: str) -> list[dict
             deal["current_roc_estimate"] = float(a11_row["roc"]) if a11_row and a11_row["roc"] else None
 
     return deals
+
+
+def run_portfolio_stress_test(conn: psycopg.Connection, org_id: str, params: StressParams) -> dict:
+    """Section 47. Every owned asset (is_acquired = true) is stressed: acquisition
+    deals against their active A-02 snapshot, development deals still in construction
+    (not yet stabilized/closed/dead) against their active A-11 snapshot. A deal with
+    neither an active A-02 nor A-11 snapshot has nothing to stress and is skipped —
+    that's an active-snapshot gap the daily brief / data quality checks surface
+    separately, not something this endpoint should silently pretend to model."""
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            "select deal_id, property_address, deal_type, status from deals "
+            "where org_id = %s and is_acquired = true",
+            (org_id,),
+        )
+        owned = cur.fetchall()
+
+        stressed_assets = []
+        for deal in owned:
+            if deal["deal_type"] in ("land", "development") and deal["status"] != "stabilized":
+                cur.execute(
+                    "select output_payload from deal_snapshots "
+                    "where deal_id = %s and agent_id = 'a11' and is_active = true",
+                    (deal["deal_id"],),
+                )
+                snapshot = cur.fetchone()
+                if snapshot is None:
+                    continue
+                result = stress_development_asset(baseline=snapshot["output_payload"], params=params)
+            else:
+                cur.execute(
+                    "select output_payload from deal_snapshots "
+                    "where deal_id = %s and agent_id = 'a02' and is_active = true",
+                    (deal["deal_id"],),
+                )
+                snapshot = cur.fetchone()
+                if snapshot is None:
+                    continue
+                result = stress_acquisition_asset(baseline=snapshot["output_payload"], params=params)
+
+            result["deal_id"] = deal["deal_id"]
+            result["property_address"] = deal["property_address"]
+            stressed_assets.append(result)
+
+    summary = summarize_portfolio_stress(stressed_assets)
+    summary["assets"] = stressed_assets
+    summary["params"] = {
+        "interest_rate_shock_bps": params.interest_rate_shock_bps,
+        "vacancy_shock_bps": params.vacancy_shock_bps,
+        "cap_rate_expansion_bps": params.cap_rate_expansion_bps,
+    }
+    return summary
