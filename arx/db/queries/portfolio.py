@@ -22,26 +22,40 @@ def record_deal_performance(
     deal_id: str, org_id: str, period: str, actual_gross_rent: float | None,
     actual_vacancy_rate: float | None, actual_noi: float | None,
     actual_operating_expenses: float | None, notes: str | None, created_by_user_id: str | None,
+    data_source: str = "manual",
 ) -> str:
     row = conn.execute(
         """
         insert into deal_performance (deal_id, org_id, period, actual_gross_rent,
                                        actual_vacancy_rate, actual_noi, actual_operating_expenses,
-                                       notes, created_by_user_id)
-        values (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                                       notes, created_by_user_id, data_source)
+        values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         on conflict (deal_id, period) do update set
             actual_gross_rent = excluded.actual_gross_rent,
             actual_vacancy_rate = excluded.actual_vacancy_rate,
             actual_noi = excluded.actual_noi,
             actual_operating_expenses = excluded.actual_operating_expenses,
             notes = excluded.notes,
-            created_by_user_id = excluded.created_by_user_id
+            created_by_user_id = excluded.created_by_user_id,
+            data_source = excluded.data_source
         returning performance_id
         """,
         (deal_id, org_id, period, actual_gross_rent, actual_vacancy_rate,
-         actual_noi, actual_operating_expenses, notes, created_by_user_id),
+         actual_noi, actual_operating_expenses, notes, created_by_user_id, data_source),
     ).fetchone()
     return str(row[0])
+
+
+def get_active_a02_noi(conn: psycopg.Connection, deal_id: str) -> float | None:
+    """Section 45: "System calculates actual NOI vs. projected from active A-02
+    snapshot at acquisition." Returns None if the deal has no active A-02 snapshot —
+    variance simply can't be computed yet, not an error."""
+    row = conn.execute(
+        "select output_payload ->> 'noi' as noi from deal_snapshots "
+        "where deal_id = %s and agent_id = 'a02' and is_active = true",
+        (deal_id,),
+    ).fetchone()
+    return float(row[0]) if row and row[0] is not None else None
 
 
 def list_deal_performance(conn: psycopg.Connection, deal_id: str) -> list[dict]:

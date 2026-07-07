@@ -2,17 +2,19 @@
 LP milestone-delay notification needs a real write path to development_milestones,
 which nothing before Phase 5 provided)."""
 from datetime import date
+from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from psycopg.rows import dict_row
 from pydantic import BaseModel
 
-from arx.agents.notification_rules import milestone_delay_notification
+from arx.agents.notification_rules import milestone_delay_notification, performance_variance_notification
 from arx.agents.portfolio_stress import StressParams
 from arx.api.auth import CurrentUser, require_role
 from arx.api.deps import claims_for
 from arx.db.connection import db_session
 from arx.db.queries.portfolio import (
+    get_active_a02_noi,
     get_development_pipeline,
     get_portfolio_summary,
     list_deal_performance,
@@ -31,6 +33,7 @@ class DealPerformanceRequest(BaseModel):
     actual_noi: float | None = None
     actual_operating_expenses: float | None = None
     notes: str | None = None
+    data_source: Literal["manual", "pm_integration"] = "manual"
 
 
 @router.post("/deals/{deal_id}/performance", status_code=status.HTTP_201_CREATED)
@@ -38,10 +41,12 @@ def create_deal_performance(
     deal_id: str, payload: DealPerformanceRequest,
     user: CurrentUser = Depends(require_role("admin", "analyst")),
 ) -> dict:
-    """Section 29: performance actuals only make sense once a deal is owned."""
+    """Section 29: performance actuals only make sense once a deal is owned. Section 45:
+    actual NOI is compared against the active A-02 snapshot's projected NOI here —
+    variance above 10% notifies, above 20% escalates to Admin (severity critical)."""
     with db_session(claims_for(user)) as conn:
         with conn.cursor(row_factory=dict_row) as cur:
-            cur.execute("select is_acquired from deals where deal_id = %s", (deal_id,))
+            cur.execute("select is_acquired, property_address from deals where deal_id = %s", (deal_id,))
             deal = cur.fetchone()
         if deal is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Deal not found")
@@ -51,15 +56,30 @@ def create_deal_performance(
                 detail="Deal is not yet acquired (is_acquired=false) — no portfolio performance to record (Section 29)",
             )
 
+        variance_pct = None
         with conn.transaction():
             performance_id = record_deal_performance(
                 conn, deal_id=deal_id, org_id=user.org_id, period=payload.period.isoformat(),
                 actual_gross_rent=payload.actual_gross_rent, actual_vacancy_rate=payload.actual_vacancy_rate,
                 actual_noi=payload.actual_noi, actual_operating_expenses=payload.actual_operating_expenses,
-                notes=payload.notes, created_by_user_id=user.user_id,
+                notes=payload.notes, created_by_user_id=user.user_id, data_source=payload.data_source,
             )
 
-    return {"performance_id": performance_id, "deal_id": deal_id, "period": payload.period.isoformat()}
+            if payload.actual_noi is not None:
+                projected_noi = get_active_a02_noi(conn, deal_id)
+                if projected_noi is not None and projected_noi != 0:
+                    variance_pct = (payload.actual_noi - projected_noi) / projected_noi
+                    spec = performance_variance_notification(
+                        property_address=deal["property_address"], actual_noi=payload.actual_noi,
+                        projected_noi=projected_noi, variance_pct=variance_pct,
+                    )
+                    if spec is not None:
+                        InAppChannel().send(conn, org_id=user.org_id, spec=spec, deal_id=deal_id)
+
+    return {
+        "performance_id": performance_id, "deal_id": deal_id, "period": payload.period.isoformat(),
+        "variance_pct": variance_pct,
+    }
 
 
 @router.get("/deals/{deal_id}/performance")

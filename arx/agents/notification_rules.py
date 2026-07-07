@@ -17,6 +17,10 @@ ACCURACY_FLAG_ADMIN_THRESHOLD = 3
 # ZONIQ operating-cadence assumption, same category as momentum_scoring.py's
 # documented thresholds.
 MILESTONE_DELAY_THRESHOLD_DAYS = 14
+# Section 45: "Variance above 10% triggers notification. Variance above 20% triggers
+# Admin escalation."
+PERFORMANCE_VARIANCE_NOTIFY_THRESHOLD = 0.10
+PERFORMANCE_VARIANCE_ADMIN_ESCALATION_THRESHOLD = 0.20
 
 
 @dataclass(frozen=True)
@@ -137,6 +141,26 @@ def error_on_active_deal_notification(
         body=f"An unrecoverable error ({error_type}) occurred"
              + (f" in agent '{agent_id}'" if agent_id else "") + f" while the deal was in '{deal_status}'.",
         source_agent=agent_id,
+    )
+
+
+def performance_variance_notification(
+    *, property_address: str, actual_noi: float, projected_noi: float, variance_pct: float,
+) -> NotificationSpec | None:
+    """Section 45: actual NOI vs. the projected NOI from the active A-02 snapshot at
+    acquisition. Below the 10% threshold is normal operating noise, not worth a
+    notification. 10-20% is a regular notification; 20%+ escalates to Admin (severity
+    critical) — same two-tier shape as accuracy_flag_threshold_notification's
+    escalation, just on a different metric."""
+    if abs(variance_pct) < PERFORMANCE_VARIANCE_NOTIFY_THRESHOLD:
+        return None
+    severity = "critical" if abs(variance_pct) >= PERFORMANCE_VARIANCE_ADMIN_ESCALATION_THRESHOLD else "warning"
+    direction = "above" if variance_pct > 0 else "below"
+    return NotificationSpec(
+        notification_type="performance_variance", severity=severity,
+        title=f"NOI variance {'escalation' if severity == 'critical' else 'alert'}: {property_address}",
+        body=f"Actual NOI (${actual_noi:,.0f}) is {abs(variance_pct) * 100:.1f}% {direction} the projected "
+             f"NOI (${projected_noi:,.0f}) from the active A-02 snapshot.",
     )
 
 
