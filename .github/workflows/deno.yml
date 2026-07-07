@@ -38,5 +38,15 @@ jobs:
       - name: Run linter
         run: deno lint
 
-      - name: Run tests
-        run: deno test -A
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install server dependencies
+        run: npm install
+        working-directory: server
+
+      - name: Run server tests
+        run: npx vitest run
+        working-directory: server

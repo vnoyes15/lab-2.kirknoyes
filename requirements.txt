@@ -1,0 +1,44 @@
+# Arx Phase 1 — Foundation
+# Section 05 tech stack. Pin exact versions; bump deliberately.
+
+# Backend / API
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+pydantic==2.10.4
+pydantic-settings==2.7.1
+python-multipart==0.0.20
+
+# Auth / JWT (Supabase auth verification)
+pyjwt==2.10.1
+
+# Database
+psycopg[binary]==3.2.3
+psycopg-pool==3.2.4
+supabase==2.11.0
+
+# Orchestration (Section 04) — scaffold only in Phase 1, no agent logic
+langgraph==0.2.62
+langchain-anthropic==0.3.4
+
+# AI model client (Section 05 — model-agnostic interface wraps this)
+anthropic==0.42.0
+
+# Task queue (Section 05) — wired in Phase 1, jobs added starting Phase 4 (N8)
+celery[redis]==5.4.0
+redis==5.2.1
+
+# Document processing (Section 05) — dependency present from Phase 1, used starting A-09 in Phase 2
+pymupdf==1.25.1
+python-docx==1.1.2
+openpyxl==3.1.5
+
+# Testing
+pytest==8.3.4
+pytest-asyncio==0.25.0
+httpx==0.28.1
+
+# Prompt files (Section 86 prompt versioning convention)
+pyyaml==6.0.3
+
+# Dev tooling
+python-dotenv==1.0.1
