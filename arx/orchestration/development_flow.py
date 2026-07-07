@@ -9,9 +9,8 @@ A-10 recommends it (Section 10 A-10 HANDOFF).
 """
 from langgraph.graph import END, START, StateGraph
 
-from arx.orchestration.nodes import a01_node
-from arx.orchestration.placeholders import placeholder_node
-from arx.orchestration.routing import route_after_land_screening, route_after_screening
+from arx.orchestration.nodes import a01_node, a03_node, a10_node, a11_node
+from arx.orchestration.routing import route_after_land_screening, route_after_screening, route_unless_terminated
 from arx.orchestration.state import DealGraphState
 
 
@@ -19,9 +18,9 @@ def build_development_flow() -> StateGraph:
     graph = StateGraph(DealGraphState)
 
     graph.add_node("a01", a01_node)  # real (Phase 2) — see arx/orchestration/nodes.py
-    graph.add_node("a10", placeholder_node("a10", lands_in_phase=4))
-    graph.add_node("a03", placeholder_node("a03", lands_in_phase=3))
-    graph.add_node("a11", placeholder_node("a11", lands_in_phase=4))
+    graph.add_node("a10", a10_node)  # real (Phase 4)
+    graph.add_node("a03", a03_node)  # real (Phase 3)
+    graph.add_node("a11", a11_node)  # real (Phase 4)
 
     graph.add_edge(START, "a01")
     graph.add_conditional_edges(
@@ -36,7 +35,7 @@ def build_development_flow() -> StateGraph:
         route_after_land_screening,
         {"a11": "a11", "a03": "a03", "end": END},
     )
-    graph.add_edge("a03", "a11")
+    graph.add_conditional_edges("a03", route_unless_terminated("a11"), {"a11": "a11", END: END})
     graph.add_edge("a11", END)
 
     return graph

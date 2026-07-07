@@ -20,18 +20,33 @@ from arx.agents.a02_underwriting_agent import A02ValidationError, run_a02
 from arx.agents.a03_seller_profiler import A03ValidationError, run_a03
 from arx.agents.a04_offer_strategy import A04ValidationError, run_a04
 from arx.agents.a05_loi_drafting import A05ValidationError, run_a05
+from arx.agents.a06_due_diligence import A06ValidationError, run_a06
 from arx.agents.a07_deal_memo_writer import A07ValidationError, run_a07
+from arx.agents.a08_outreach import (
+    DEFAULT_DAILY_SEND_LIMIT,
+    A08DailyLimitError,
+    A08SuppressedError,
+    A08ValidationError,
+    run_a08,
+)
 from arx.agents.a09_document_intelligence import A09ValidationError, run_a09
+from arx.agents.a10_land_acquisition import A10ValidationError, run_a10
+from arx.agents.a11_development_pro_forma import A11ValidationError, run_a11
 from arx.agents.a12_negotiation_support import A12ValidationError, run_a12
 from arx.agents.a13_capital_raise import A13ValidationError, run_a13
 from arx.agents.errors import AgentValidationError
 from arx.agents.model_client import ModelClient, model_client_dependency
+from arx.agents.notification_rules import (
+    daily_send_limit_reached_notification,
+    deal_advancement_blocked_notification,
+)
 from arx.api.auth import CurrentUser, require_role
 from arx.api.deps import claims_for
 from arx.db.connection import db_session
 from arx.db.queries.cost_controls import check_budget, increment_token_usage
 from arx.db.queries.quality_log import record_agent_run, record_error
 from arx.db.queries.snapshots import activate_snapshot, get_active_snapshot, write_snapshot
+from arx.notifications.channels import InAppChannel
 
 router = APIRouter(prefix="/api/v1/deals", tags=["agents"])
 
@@ -666,6 +681,289 @@ def invoke_a13(
             )
             record_agent_run(
                 conn, org_id=user.org_id, deal_id=deal_id, agent_id="a13", prompt_version=result.prompt_version,
+                confidence_score=None, validation_passed=True, failed_checks=None,
+                token_count=result.input_tokens + result.output_tokens,
+            )
+            increment_token_usage(conn, user.org_id, result.input_tokens + result.output_tokens)
+
+    return {"snapshot_id": snapshot_id, "output": result.output.model_dump()}
+
+
+# --------------------------------------------------------------------------- A-10 ---
+
+class A10Request(BaseModel):
+    intended_use: str | None = None
+    zoning_info: dict | None = None
+    site_info: dict | None = None
+    owner_name: str | None = None
+    ownership_duration_years: float | None = None
+    entity_type: str | None = None
+    org_land_cost_per_unit_benchmark: float | None = None
+
+
+@router.post("/{deal_id}/agents/a10")
+def invoke_a10(
+    deal_id: str, payload: A10Request,
+    user: CurrentUser = Depends(require_role("admin", "analyst")),
+    model_client: ModelClient = Depends(model_client_dependency),
+):
+    with db_session(claims_for(user)) as conn:
+        deal = _get_deal(conn, deal_id)
+        _enforce_budget_or_raise(conn, user.org_id)
+
+        try:
+            result = run_a10(
+                property_address=deal["property_address"], land_area_sf=deal["land_area_sf"],
+                asking_price=deal["asking_price"], intended_use=payload.intended_use,
+                zoning_info=payload.zoning_info, site_info=payload.site_info,
+                owner_name=payload.owner_name, ownership_duration_years=payload.ownership_duration_years,
+                entity_type=payload.entity_type,
+                org_land_cost_per_unit_benchmark=payload.org_land_cost_per_unit_benchmark,
+                model_client=model_client,
+            )
+        except A10ValidationError as exc:
+            with conn.transaction():
+                http_exc = _handle_agent_failure(conn, org_id=user.org_id, deal_id=deal_id, agent_id="a10", exc=exc)
+            raise http_exc
+
+        with conn.transaction():
+            snapshot_id = write_snapshot(
+                conn, deal_id=deal_id, org_id=user.org_id, agent_id="a10",
+                input_payload=payload.model_dump(), output_payload=result.output.model_dump(),
+                confidence_score=result.output.confidence_score, created_by_user_id=user.user_id,
+            )
+            record_agent_run(
+                conn, org_id=user.org_id, deal_id=deal_id, agent_id="a10", prompt_version=result.prompt_version,
+                confidence_score=result.output.confidence_score, validation_passed=True, failed_checks=None,
+                token_count=result.input_tokens + result.output_tokens,
+            )
+            increment_token_usage(conn, user.org_id, result.input_tokens + result.output_tokens)
+
+    return {"snapshot_id": snapshot_id, "output": result.output.model_dump()}
+
+
+# --------------------------------------------------------------------------- A-11 ---
+
+class A11Request(BaseModel):
+    land_cost: float
+    unit_count: int | None = None
+    asset_type: str = "multifamily"
+    exit_cap_rate: float
+    entitlement_context: dict | None = None
+    rent_comps: list[dict] | None = None
+
+
+@router.post("/{deal_id}/agents/a11")
+def invoke_a11(
+    deal_id: str, payload: A11Request,
+    user: CurrentUser = Depends(require_role("admin", "analyst")),
+    model_client: ModelClient = Depends(model_client_dependency),
+):
+    with db_session(claims_for(user)) as conn:
+        _get_deal(conn, deal_id)
+        _enforce_budget_or_raise(conn, user.org_id)
+
+        dev_config = _get_active_uw_config(conn, user.org_id, "development")
+        if dev_config is None:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="No active development uw_config for this org")
+
+        try:
+            result = run_a11(
+                land_cost=payload.land_cost, unit_count=payload.unit_count, asset_type=payload.asset_type,
+                dev_defaults=dev_config["config"], exit_cap_rate=payload.exit_cap_rate,
+                entitlement_context=payload.entitlement_context, rent_comps=payload.rent_comps,
+                model_client=model_client,
+            )
+        except A11ValidationError as exc:
+            with conn.transaction():
+                http_exc = _handle_agent_failure(conn, org_id=user.org_id, deal_id=deal_id, agent_id="a11", exc=exc)
+            raise http_exc
+
+        with conn.transaction():
+            snapshot_id = write_snapshot(
+                conn, deal_id=deal_id, org_id=user.org_id, agent_id="a11",
+                input_payload=payload.model_dump(), output_payload=result.output.model_dump(),
+                confidence_score=result.output.confidence_score.overall, created_by_user_id=user.user_id,
+            )
+            record_agent_run(
+                conn, org_id=user.org_id, deal_id=deal_id, agent_id="a11", prompt_version=result.prompt_version,
+                confidence_score=result.output.confidence_score.overall, validation_passed=True, failed_checks=None,
+                token_count=result.input_tokens + result.output_tokens,
+            )
+            increment_token_usage(conn, user.org_id, result.input_tokens + result.output_tokens)
+
+    return {"snapshot_id": snapshot_id, "output": result.output.model_dump(), "validation": result.validation.to_dict()}
+
+
+# --------------------------------------------------------------------------- A-06 ---
+
+class A06Request(BaseModel):
+    dd_track: Literal["acquisition", "land_development"]
+    deal_facts: dict = {}
+    is_wa_multifamily: bool = False
+
+
+@router.post("/{deal_id}/agents/a06")
+def invoke_a06(
+    deal_id: str, payload: A06Request,
+    user: CurrentUser = Depends(require_role("admin", "analyst")),
+    model_client: ModelClient = Depends(model_client_dependency),
+):
+    with db_session(claims_for(user)) as conn:
+        deal = _get_deal(conn, deal_id)
+        _enforce_budget_or_raise(conn, user.org_id)
+
+        try:
+            result = run_a06(
+                dd_track=payload.dd_track, deal_facts=payload.deal_facts,
+                is_wa_multifamily=payload.is_wa_multifamily, model_client=model_client,
+            )
+        except A06ValidationError as exc:
+            with conn.transaction():
+                http_exc = _handle_agent_failure(conn, org_id=user.org_id, deal_id=deal_id, agent_id="a06", exc=exc)
+            raise http_exc
+
+        with conn.transaction():
+            # Section 03: A-06 creates deal_tasks from the checklist — one per item —
+            # and tasks_created (Section 87) is populated here, after persistence,
+            # same pattern as A-05/A-07's document_vault_path.
+            all_items = list(result.output.checklist_items)
+            if result.output.wa_rent_compliance_item is not None:
+                all_items.append(result.output.wa_rent_compliance_item)
+
+            task_ids = []
+            for item in all_items:
+                priority = "high" if item.status == "flagged" else "medium"
+                # deal_tasks has no 'flagged' status, so a flagged checklist item maps to
+                # 'in_progress' (still open, needs attention) rather than 'complete'.
+                task_status = "in_progress" if item.status == "flagged" else item.status
+                completed_at = "now()" if task_status == "complete" else "null"
+                row = conn.execute(
+                    f"""
+                    insert into deal_tasks (deal_id, org_id, title, description, status, priority, source_agent, completed_at)
+                    values (%s, %s, %s, %s, %s, %s, 'a06', {completed_at})
+                    returning task_id
+                    """,
+                    (deal_id, user.org_id, f"DD: {item.category}", item.description, task_status, priority),
+                ).fetchone()
+                task_ids.append(str(row[0]))
+
+            final_output = result.output.model_copy(update={"tasks_created": task_ids})
+
+            if final_output.deal_advancement_blocked:
+                blocking_items = [
+                    item.model_dump() for item in all_items if item.status in ("flagged", "not_started")
+                ]
+                spec = deal_advancement_blocked_notification(
+                    property_address=deal["property_address"], blocking_items=blocking_items,
+                )
+                if spec is not None:
+                    InAppChannel().send(conn, org_id=user.org_id, spec=spec, deal_id=deal_id)
+
+            snapshot_id = write_snapshot(
+                conn, deal_id=deal_id, org_id=user.org_id, agent_id="a06",
+                input_payload=payload.model_dump(), output_payload=final_output.model_dump(),
+                confidence_score=None, created_by_user_id=user.user_id,
+            )
+            record_agent_run(
+                conn, org_id=user.org_id, deal_id=deal_id, agent_id="a06", prompt_version=result.prompt_version,
+                confidence_score=None, validation_passed=True, failed_checks=None,
+                token_count=result.input_tokens + result.output_tokens,
+            )
+            increment_token_usage(conn, user.org_id, result.input_tokens + result.output_tokens)
+
+    return {"snapshot_id": snapshot_id, "output": final_output.model_dump()}
+
+
+# --------------------------------------------------------------------------- A-08 ---
+
+class A08Request(BaseModel):
+    contact_id: str
+    recipient_type: Literal["seller", "broker", "lender", "lp"]
+    channel: Literal["email", "sms", "linkedin", "phone_script"]
+
+
+@router.post("/{deal_id}/agents/a08")
+def invoke_a08(
+    deal_id: str, payload: A08Request,
+    user: CurrentUser = Depends(require_role("admin", "analyst")),
+    model_client: ModelClient = Depends(model_client_dependency),
+):
+    with db_session(claims_for(user)) as conn:
+        deal = _get_deal(conn, deal_id)
+        _enforce_budget_or_raise(conn, user.org_id)
+
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("select * from contacts where contact_id = %s", (payload.contact_id,))
+            contact = cur.fetchone()
+        if contact is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Contact not found")
+
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "select count(*) as n from outreach_log where org_id = %s and sent_at >= current_date",
+                (user.org_id,),
+            )
+            daily_send_count_so_far = cur.fetchone()["n"]
+
+        try:
+            result = run_a08(
+                recipient_type=payload.recipient_type, recipient_context=dict(contact),
+                channel=payload.channel, deal_context={"deal_id": deal_id, "asset_type": deal["asset_type"]},
+                is_suppressed=contact["suppressed"], daily_send_count_so_far=daily_send_count_so_far,
+                model_client=model_client,
+            )
+        except A08SuppressedError as exc:
+            with conn.transaction():
+                error_id = record_error(
+                    conn, org_id=user.org_id, deal_id=deal_id, error_type="suppressed_contact",
+                    agent_id="a08", step="pre_check", input_payload=payload.model_dump(),
+                    raw_output=None, failed_checks=None,
+                )
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail={"message": str(exc), "error_id": error_id})
+        except A08DailyLimitError as exc:
+            with conn.transaction():
+                error_id = record_error(
+                    conn, org_id=user.org_id, deal_id=deal_id, error_type="daily_limit_reached",
+                    agent_id="a08", step="pre_check", input_payload=payload.model_dump(),
+                    raw_output=None, failed_checks=None,
+                )
+                # Every subsequent call that hits the limit on the same day would
+                # otherwise re-notify — one duplicate per rejected outreach attempt.
+                # Only notify the first time today.
+                already_notified_today = conn.execute(
+                    "select 1 from notifications where org_id = %s and notification_type = "
+                    "'daily_send_limit_reached' and created_at >= current_date",
+                    (user.org_id,),
+                ).fetchone()
+                if already_notified_today is None:
+                    spec = daily_send_limit_reached_notification(daily_send_limit=DEFAULT_DAILY_SEND_LIMIT)
+                    InAppChannel().send(conn, org_id=user.org_id, spec=spec, deal_id=None)
+            raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail={"message": str(exc), "error_id": error_id})
+        except A08ValidationError as exc:
+            with conn.transaction():
+                http_exc = _handle_agent_failure(conn, org_id=user.org_id, deal_id=deal_id, agent_id="a08", exc=exc)
+            raise http_exc
+
+        with conn.transaction():
+            conn.execute(
+                """
+                insert into outreach_log (org_id, contact_id, deal_id, recipient_type, channel, message_text, sent_by_user_id)
+                values (%s, %s, %s, %s, %s, %s, %s)
+                """,
+                (user.org_id, payload.contact_id, deal_id, payload.recipient_type, payload.channel,
+                 result.output.message_text, user.user_id),
+            )
+            conn.execute(
+                "update contacts set last_contacted_at = now() where contact_id = %s", (payload.contact_id,)
+            )
+            snapshot_id = write_snapshot(
+                conn, deal_id=deal_id, org_id=user.org_id, agent_id="a08",
+                input_payload=payload.model_dump(), output_payload=result.output.model_dump(),
+                confidence_score=None, created_by_user_id=user.user_id,
+            )
+            record_agent_run(
+                conn, org_id=user.org_id, deal_id=deal_id, agent_id="a08", prompt_version=result.prompt_version,
                 confidence_score=None, validation_passed=True, failed_checks=None,
                 token_count=result.input_tokens + result.output_tokens,
             )

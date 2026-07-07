@@ -1,5 +1,5 @@
-"""Real agent nodes for Phase 2 (A-01, A-02, A-07, A-09) and Phase 3
-(A-03, A-04, A-05, A-12).
+"""Real agent nodes for Phase 2 (A-01, A-02, A-07, A-09), Phase 3
+(A-03, A-04, A-05, A-12), and Phase 4 (A-10, A-11).
 
 SCOPE BOUNDARY — read this before wiring more into the graph. Section 07 Phase 2 asks
 for A-09 -> A-01 -> A-02 -> A-07 to exist and be callable; the orchestration layer's
@@ -24,6 +24,8 @@ from arx.agents.a04_offer_strategy import A04ValidationError, run_a04
 from arx.agents.a05_loi_drafting import A05ValidationError, run_a05
 from arx.agents.a07_deal_memo_writer import A07ValidationError, run_a07
 from arx.agents.a09_document_intelligence import A09ValidationError, run_a09
+from arx.agents.a10_land_acquisition import A10ValidationError, run_a10
+from arx.agents.a11_development_pro_forma import A11ValidationError, run_a11
 from arx.agents.a12_negotiation_support import A12ValidationError, run_a12
 from arx.agents.errors import AgentValidationError
 from arx.orchestration.state import DealGraphState
@@ -213,3 +215,50 @@ def a12_node(state: DealGraphState) -> dict:
         return _terminated("a12", exc)
 
     return {"agent_outputs": {**state.get("agent_outputs", {}), "a12": result.output.model_dump()}}
+
+
+def a10_node(state: DealGraphState) -> dict:
+    try:
+        result = run_a10(
+            property_address=state["property_address"],
+            land_area_sf=state.get("land_area_sf"),
+            asking_price=state.get("asking_price"),
+            intended_use=state.get("intended_use"),
+            zoning_info=state.get("zoning_info"),
+            site_info=state.get("site_info"),
+            owner_name=state.get("owner_name"),
+            ownership_duration_years=state.get("ownership_duration_years"),
+            entity_type=state.get("entity_type"),
+            org_land_cost_per_unit_benchmark=state.get("org_land_cost_per_unit_benchmark"),
+        )
+    except A10ValidationError as exc:
+        return _terminated("a10", exc)
+
+    return {"agent_outputs": {**state.get("agent_outputs", {}), "a10": result.output.model_dump()}}
+
+
+def a11_node(state: DealGraphState) -> dict:
+    # A-11 runs either directly off an already-owned/entitled deal (route_after_screening's
+    # "development" branch) or after A-10 has screened a raw land parcel (Section 04 R7).
+    # In both cases the land cost is the deal's actual price, not A-10's per-unit estimate
+    # (that estimate is a benchmark comparison, Section 87, not a substitute for the real
+    # asking price) — so land_cost falls back to state["asking_price"] unless the caller
+    # supplies an explicit override.
+    land_cost = state.get("land_cost")
+    if land_cost is None:
+        land_cost = state.get("asking_price")
+
+    try:
+        result = run_a11(
+            land_cost=land_cost,
+            unit_count=state.get("unit_count"),
+            asset_type=state.get("asset_type", "multifamily"),
+            dev_defaults=state["dev_defaults"],
+            exit_cap_rate=state["exit_cap_rate"],
+            entitlement_context=state.get("entitlement_context"),
+            rent_comps=state.get("rent_comps"),
+        )
+    except A11ValidationError as exc:
+        return _terminated("a11", exc)
+
+    return {"agent_outputs": {**state.get("agent_outputs", {}), "a11": result.output.model_dump()}}

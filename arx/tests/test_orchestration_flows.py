@@ -1,9 +1,9 @@
 """These tests prove the graph *topology* (edges, conditional routing, state threading)
 correctly drives real agent logic end-to-end (Section 04) for the Phase 2 agents
-(A-01, A-02, A-07, A-09), while a10/a03/a11 remain placeholders that fail loudly by
-name rather than silently. See arx/orchestration/nodes.py's docstring for the scope
-boundary: these graphs are exercised here and available for a future autonomous mode,
-but arx/api/agents.py's per-agent endpoints are Phase 2's actual production path.
+(A-01, A-02, A-07, A-09) plus Phase 3/4's A-03/A-10/A-11. See arx/orchestration/nodes.py's
+docstring for the scope boundary: these graphs are exercised here and available for a
+future autonomous mode, but arx/api/agents.py's per-agent endpoints are the actual
+production path.
 
 Real agent nodes call get_default_model_client() internally; every test here patches
 the module-level singleton to a FakeModelClient so no test ever reaches the real
@@ -124,18 +124,133 @@ def test_acquisition_flow_no_go_terminates_before_a02(fake_client):
     assert "a02" not in result.get("agent_outputs", {})
 
 
-def test_development_flow_entry_is_real_a01_still_reaches_placeholder_a11(fake_client):
-    fake_client.generate_json = lambda *a, **k: FakeModelClient({
+LAND_COST = 800_000
+HARD_COSTS = 4_800_000
+SOFT_COSTS = 960_000
+FINANCING_COSTS = 240_000
+CONTINGENCY = 400_000
+TOTAL_PROJECT_COST = LAND_COST + HARD_COSTS + SOFT_COSTS + FINANCING_COSTS + CONTINGENCY
+STABILIZED_NOI = TOTAL_PROJECT_COST * 0.08
+RETURN_ON_COST = STABILIZED_NOI / TOTAL_PROJECT_COST
+EXIT_CAP_RATE = 0.06
+DEVELOPMENT_SPREAD = RETURN_ON_COST - EXIT_CAP_RATE
+EQUITY = 3_000_000
+PAYOFF = EQUITY * (1.20 ** 3)
+
+
+def _a11_response(**overrides):
+    base = {
+        "total_project_cost": TOTAL_PROJECT_COST,
+        "cost_breakdown": {
+            "land_cost": LAND_COST, "hard_costs": HARD_COSTS, "soft_costs": SOFT_COSTS,
+            "financing_costs": FINANCING_COSTS, "contingency": CONTINGENCY,
+        },
+        "stabilized_noi": STABILIZED_NOI, "return_on_cost": RETURN_ON_COST, "exit_cap_rate": EXIT_CAP_RATE,
+        "development_spread": DEVELOPMENT_SPREAD, "value_destructive": False,
+        "cash_flows": [-EQUITY, 0, 0, PAYOFF], "irr": 0.20,
+        "construction_draw_schedule": [
+            {"period": "Q1", "draw_amount": 1_200_000, "cumulative_drawn": 1_200_000},
+            {"period": "Q2", "draw_amount": 1_200_000, "cumulative_drawn": 2_400_000},
+            {"period": "Q3", "draw_amount": 1_200_000, "cumulative_drawn": 3_600_000},
+            {"period": "Q4", "draw_amount": 1_200_000, "cumulative_drawn": 4_800_000},
+        ],
+        "cost_overrun_sensitivity": {
+            "base": {"return_on_cost": 0.08}, "cost_overrun_5pct": {"return_on_cost": 0.076},
+            "cost_overrun_10pct": {"return_on_cost": 0.072}, "cost_overrun_15pct": {"return_on_cost": 0.068},
+        },
+        "absorption_delay_sensitivity": {
+            "base": {"return_on_cost": 0.08}, "absorption_delay_3mo": {"return_on_cost": 0.078},
+            "absorption_delay_6mo": {"return_on_cost": 0.075},
+        },
+        "risk_flags": [
+            "entitlement:conditional use permit still pending city council vote",
+            "construction_cost:steel pricing has been volatile in this market",
+            "absorption:two comparable projects are delivering units in the same window",
+            "financing:construction loan rate lock expires before permits are expected",
+        ],
+        "confidence_score": {"overall": "medium", "entitlement_confidence": "medium", "construction_cost_confidence": "high"},
+    }
+    base.update(overrides)
+    return base
+
+
+def test_development_flow_direct_development_chains_a01_a11(fake_client):
+    a01_response = {
         "deal_id": "d2", "deal_type_detected": "development", "go_no_go": "go",
         "preliminary_cap_rate": None, "preliminary_roc": 0.09, "in_target_range": True,
         "missing_fields": [], "rationale": "Return on cost estimate exceeds the org's development threshold.",
         "routing_recommendation": "route_to_a10", "confidence_score": "medium",
         "document_extraction_required": False,
-    }).generate_json(*a, **k)
+    }
+    responses = iter([a01_response, _a11_response()])
+    fake_client.generate_json = lambda *a, **k: FakeModelClient(next(responses)).generate_json(*a, **k)
 
-    with pytest.raises(NotImplementedError, match="'a11'"):
-        development_flow.invoke({
-            "deal_id": "d2", "org_id": "o1", "property_address": "Vacant lot, Auburn WA",
-            "asking_price": 800_000, "deal_type": "development",
-            "target_cap_rate_range": None, "target_roc_range": (0.15, 0.20),
-        })
+    result = development_flow.invoke({
+        "deal_id": "d2", "org_id": "o1", "property_address": "Vacant lot, Auburn WA",
+        "asking_price": LAND_COST, "deal_type": "development",
+        "target_cap_rate_range": None, "target_roc_range": (0.15, 0.20),
+        "dev_defaults": {"soft_costs_pct_of_hard_min": 0.15, "soft_costs_pct_of_hard_max": 0.20},
+        "exit_cap_rate": EXIT_CAP_RATE, "unit_count": 32,
+    })
+
+    assert result.get("terminated") is not True
+    assert result["agent_outputs"]["a01"]["go_no_go"] == "go"
+    assert result["agent_outputs"]["a11"]["value_destructive"] is False
+
+
+def test_development_flow_land_chains_a01_a10_a11(fake_client):
+    a01_response = {
+        "deal_id": "d3", "deal_type_detected": "land", "go_no_go": "go",
+        "preliminary_cap_rate": None, "preliminary_roc": None, "in_target_range": True,
+        "missing_fields": [], "rationale": "Raw land parcel with unresolved entitlement status, routed to A-10 for a full feasibility screen.",
+        "routing_recommendation": "route_to_a10", "confidence_score": "medium",
+        "document_extraction_required": False,
+    }
+    a10_response = {
+        "feasibility_recommendation": "pursue", "entitlement_path": "by_right",
+        "site_risk_flags": [], "seller_archetype": "long_hold", "routing_recommendation": "route_to_a11",
+        "confidence_score": "medium", "estimated_developable_units": 32,
+        "estimated_land_cost_per_unit": 25_000, "entitlement_timeline_estimate_months": 4,
+        "land_cost_benchmark_comparison": "In line with the org's $25,000/unit benchmark.",
+    }
+    responses = iter([a01_response, a10_response, _a11_response()])
+    fake_client.generate_json = lambda *a, **k: FakeModelClient(next(responses)).generate_json(*a, **k)
+
+    result = development_flow.invoke({
+        "deal_id": "d3", "org_id": "o1", "property_address": "Vacant lot, Kent WA",
+        "asking_price": LAND_COST, "land_area_sf": 40_000, "deal_type": "land",
+        "intended_use": "multifamily", "target_cap_rate_range": None, "target_roc_range": (0.15, 0.20),
+        "dev_defaults": {"soft_costs_pct_of_hard_min": 0.15, "soft_costs_pct_of_hard_max": 0.20},
+        "exit_cap_rate": EXIT_CAP_RATE, "unit_count": 32,
+    })
+
+    assert result.get("terminated") is not True
+    assert result["agent_outputs"]["a10"]["routing_recommendation"] == "route_to_a11"
+    assert result["agent_outputs"]["a11"]["value_destructive"] is False
+
+
+def test_development_flow_land_no_go_terminates_before_a11(fake_client):
+    a01_response = {
+        "deal_id": "d4", "deal_type_detected": "land", "go_no_go": "go",
+        "preliminary_cap_rate": None, "preliminary_roc": None, "in_target_range": True,
+        "missing_fields": [], "rationale": "Raw land parcel with unresolved entitlement status, routed to A-10 for a full feasibility screen.",
+        "routing_recommendation": "route_to_a10", "confidence_score": "medium",
+        "document_extraction_required": False,
+    }
+    a10_response = {
+        "feasibility_recommendation": "pass", "entitlement_path": "rezoning_required",
+        "site_risk_flags": ["political_entitlement_risk"], "seller_archetype": "municipality",
+        "routing_recommendation": "pass_end", "confidence_score": "medium",
+        "estimated_developable_units": None, "estimated_land_cost_per_unit": None,
+        "entitlement_timeline_estimate_months": None, "land_cost_benchmark_comparison": None,
+    }
+    responses = iter([a01_response, a10_response])
+    fake_client.generate_json = lambda *a, **k: FakeModelClient(next(responses)).generate_json(*a, **k)
+
+    result = development_flow.invoke({
+        "deal_id": "d4", "org_id": "o1", "property_address": "City-owned parcel",
+        "asking_price": None, "land_area_sf": 20_000, "deal_type": "land",
+        "target_cap_rate_range": None, "target_roc_range": (0.15, 0.20),
+    })
+
+    assert "a11" not in result.get("agent_outputs", {})

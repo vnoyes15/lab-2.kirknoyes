@@ -3,7 +3,7 @@ middleware, API versioning. Section 01: API-first, no front end in Phase 1.
 """
 from fastapi import FastAPI
 
-from arx.api import agents, deals
+from arx.api import agents, deals, notifications
 from arx.api.config import get_settings
 
 # Fail fast at import time if required env vars are missing (Section 86) — this must
@@ -18,6 +18,7 @@ app = FastAPI(
 
 app.include_router(deals.router)
 app.include_router(agents.router)
+app.include_router(notifications.router)
 
 
 @app.get("/healthz", tags=["ops"])

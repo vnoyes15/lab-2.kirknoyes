@@ -91,3 +91,17 @@ class DealGraphState(TypedDict, total=False):
     seller_counter_terms: dict
     comparable_precedents: list[dict] | None
     org_return_thresholds: dict | None
+
+    # Phase 4 — Land / Development Layer (Section 07). A-10 inputs beyond what A-01
+    # already populates (property_address/land_area_sf/asking_price/intended_use).
+    zoning_info: dict | None
+    site_info: dict | None
+    entity_type: str | None
+    org_land_cost_per_unit_benchmark: float | None
+
+    # A-11 inputs. land_cost defaults to asking_price if unset (see nodes.py:a11_node).
+    land_cost: float | None
+    dev_defaults: dict
+    exit_cap_rate: float
+    entitlement_context: dict | None
+    rent_comps: list[dict] | None

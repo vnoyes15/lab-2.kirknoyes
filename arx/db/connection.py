@@ -18,6 +18,7 @@ from contextlib import contextmanager
 from typing import Iterator
 
 import psycopg
+from fastapi import HTTPException
 from psycopg.types.numeric import FloatLoader
 from psycopg_pool import ConnectionPool
 
@@ -58,13 +59,30 @@ def db_session(claims: dict | None = None) -> Iterator[psycopg.Connection]:
     only for platform-level operations that intentionally run outside any org's RLS
     scope (e.g. scripts/seed_org.py, which uses the Supabase service-role connection
     and bypasses RLS by design — never do this from request-handling code).
+
+    HTTPException is deliberately special-cased: every agent endpoint's error path
+    (arx/api/agents.py's _handle_agent_failure, the A08 suppressed/daily-limit
+    branches, etc.) writes an error_log row (Section 10 EH4) or a notification inside
+    this same connection's transaction and then raises HTTPException to return a
+    structured error response — that raise is a controlled outcome, not a failed
+    transaction, so it must not roll back the write that led to it. A raw
+    HTTPException(...) constructed *without* first writing anything (e.g. a 404 for a
+    deal that doesn't exist) has nothing to lose by this and behaves identically
+    either way. Any other exception (a real bug, a DB error) still rolls back, exactly
+    as `with conn.transaction()` would do on its own.
     """
     pool = get_pool()
     with pool.connection() as conn:
+        http_exc: HTTPException | None = None
         with conn.transaction():
             if claims is not None:
                 conn.execute(
                     "select set_config('request.jwt.claims', %s, true)",
                     (json.dumps(claims),),
                 )
-            yield conn
+            try:
+                yield conn
+            except HTTPException as exc:
+                http_exc = exc
+        if http_exc is not None:
+            raise http_exc

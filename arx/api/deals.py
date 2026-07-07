@@ -22,6 +22,7 @@ from pydantic import BaseModel, Field
 from arx.api.auth import CurrentUser, require_role
 from arx.api.deps import claims_for
 from arx.db.connection import db_session
+from arx.db.queries.pipeline import get_pipeline_view
 
 router = APIRouter(prefix="/api/v1/deals", tags=["deals"])
 
@@ -102,6 +103,18 @@ def create_deal(
                         detail="Deal intake conflict could not be resolved to an existing deal",
                     )
                 return DealIntakeResponse(deal_id=str(row["deal_id"]), created=False)
+
+
+@router.get("/pipeline")
+def pipeline_view(user: CurrentUser = Depends(require_role("admin", "analyst", "viewer"))) -> list[dict]:
+    """Section 06/23: every non-dead deal for the caller's org, grouped into pipeline
+    stage order with momentum_score/days_in_current_status attached (see
+    arx/db/queries/pipeline.py, arx/agents/momentum_scoring.py). Scores reflect
+    whatever arx.tasks.momentum_scorer's last nightly run computed — this endpoint
+    reads, it never recomputes inline (that stays a background-job concern, not
+    request-latency work)."""
+    with db_session(claims_for(user)) as conn:
+        return get_pipeline_view(conn, user.org_id)
 
 
 @router.get("/{deal_id}")
