@@ -3,7 +3,7 @@ middleware, API versioning. Section 01: API-first, no front end in Phase 1.
 """
 from fastapi import FastAPI
 
-from arx.api import agents, audit, daily_brief, deals, lp, notifications, pipeline, portfolio, scenarios
+from arx.api import agents, audit, daily_brief, deals, errors, lp, notifications, pipeline, portfolio, scenarios
 from arx.api.config import get_settings
 
 # Fail fast at import time if required env vars are missing (Section 86) — this must
@@ -25,6 +25,7 @@ app.include_router(lp.router)
 app.include_router(scenarios.router)
 app.include_router(audit.router)
 app.include_router(daily_brief.router)
+app.include_router(errors.router)
 
 
 @app.get("/healthz", tags=["ops"])

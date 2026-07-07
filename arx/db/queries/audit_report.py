@@ -15,6 +15,11 @@ counter-offer table. "Human decisions" here covers accuracy flags (a human revie
 and judged an output) and named scenarios modeled (a human chose to explore a
 what-if) — snapshot *activation* itself has no separate history log (only current
 is_active state is stored), a documented gap rather than a fabricated timeline.
+
+Section 78 EP3: "error record visible in audit report." `errors` includes every
+error_log row for the deal along with its resolution_status/resolution_notes (Section
+78 EP2), so the trail shows not just that something failed but whether/how it was
+resolved.
 """
 import psycopg
 from psycopg.rows import dict_row
@@ -64,6 +69,13 @@ def build_audit_report(conn: psycopg.Connection, deal_id: str) -> dict:
         )
         scenarios_modeled = cur.fetchall()
 
+        cur.execute(
+            "select error_id, error_type, agent_id, step, resolution_status, resolution_notes, created_at "
+            "from error_log where deal_id = %s order by created_at",
+            (deal_id,),
+        )
+        errors = cur.fetchall()
+
     counter_offers = [row for row in agent_outputs if row["agent_id"] == "a12"]
     accuracy_flags_set = [row for row in agent_outputs if row["accuracy_flag"] is not None]
 
@@ -79,4 +91,5 @@ def build_audit_report(conn: psycopg.Connection, deal_id: str) -> dict:
             "accuracy_flags_set": accuracy_flags_set,
             "scenarios_modeled": scenarios_modeled,
         },
+        "errors": errors,
     }

@@ -8,6 +8,7 @@ write to error_log with full input payload and raw model output.").
 import json
 
 import psycopg
+from psycopg.rows import dict_row
 
 
 def record_agent_run(
@@ -57,3 +58,29 @@ def record_error(
          json.dumps(failed_checks) if failed_checks is not None else None),
     ).fetchone()
     return str(row[0])
+
+
+def list_errors(conn: psycopg.Connection, org_id: str, resolution_status: str | None = None) -> list[dict]:
+    """Section 78 EP2: errors are tracked through to closure, not just written once and
+    forgotten — this is the list an Admin works from."""
+    query = "select * from error_log where org_id = %s"
+    params: list = [org_id]
+    if resolution_status is not None:
+        query += " and resolution_status = %s"
+        params.append(resolution_status)
+    query += " order by created_at desc"
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(query, params)
+        return cur.fetchall()
+
+
+def update_error_resolution(
+    conn: psycopg.Connection, *, org_id: str, error_id: str, resolution_status: str, resolution_notes: str | None,
+) -> dict | None:
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            "update error_log set resolution_status = %s, resolution_notes = %s "
+            "where org_id = %s and error_id = %s returning *",
+            (resolution_status, resolution_notes, org_id, error_id),
+        )
+        return cur.fetchone()
