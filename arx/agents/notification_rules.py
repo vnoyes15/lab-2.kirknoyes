@@ -164,6 +164,37 @@ def performance_variance_notification(
     )
 
 
+def refi_opportunity_notification(
+    *, property_address: str, improvement_bps: float, cash_on_cash_improvement: float,
+) -> NotificationSpec:
+    """Section 46: "Refi trigger: when refi improves debt constant by 50bps+, surfaces
+    notification with projected cash-on-cash improvement." Caller only invokes this
+    once arx.agents.refi_disposition.analyze_refi has already confirmed the trigger —
+    same "no output without a concrete triggering fact" contract as every other
+    function in this module."""
+    return NotificationSpec(
+        notification_type="refi_opportunity", severity="info",
+        title=f"Refinance opportunity: {property_address}",
+        body=f"Refinancing would improve the debt constant by {improvement_bps:.0f}bps, projected to "
+             f"improve cash-on-cash return by {cash_on_cash_improvement * 100:.1f} percentage points.",
+    )
+
+
+def disposition_opportunity_notification(
+    *, property_address: str, appreciation_pct: float,
+) -> NotificationSpec:
+    """Section 46: "Disposition trigger: cap rate compression implies value
+    appreciation above return threshold." Caller only invokes this once
+    arx.agents.refi_disposition.analyze_disposition has already confirmed the
+    trigger."""
+    return NotificationSpec(
+        notification_type="disposition_opportunity", severity="info",
+        title=f"Disposition opportunity: {property_address}",
+        body=f"Cap rate compression implies {appreciation_pct * 100:.1f}% value appreciation since "
+             f"acquisition — consider a 1031 exchange window if disposition is being pursued.",
+    )
+
+
 def daily_send_limit_reached_notification(*, daily_send_limit: int) -> NotificationSpec:
     """Fires when A-08 raises A08DailyLimitError (arx/agents/a08_outreach.py) — org-wide
     (no specific deal), so the caller passes deal_id=None to create_notification."""
