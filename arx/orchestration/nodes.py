@@ -1,4 +1,5 @@
-"""Real agent nodes for the four Phase 2 agents (A-01, A-02, A-07, A-09).
+"""Real agent nodes for Phase 2 (A-01, A-02, A-07, A-09) and Phase 3
+(A-03, A-04, A-05, A-12).
 
 SCOPE BOUNDARY — read this before wiring more into the graph. Section 07 Phase 2 asks
 for A-09 -> A-01 -> A-02 -> A-07 to exist and be callable; the orchestration layer's
@@ -18,8 +19,12 @@ teaches the graph itself how to pause for that human checkpoint.
 """
 from arx.agents.a01_deal_screener import A01ValidationError, run_a01
 from arx.agents.a02_underwriting_agent import A02ValidationError, run_a02
+from arx.agents.a03_seller_profiler import A03ValidationError, run_a03
+from arx.agents.a04_offer_strategy import A04ValidationError, run_a04
+from arx.agents.a05_loi_drafting import A05ValidationError, run_a05
 from arx.agents.a07_deal_memo_writer import A07ValidationError, run_a07
 from arx.agents.a09_document_intelligence import A09ValidationError, run_a09
+from arx.agents.a12_negotiation_support import A12ValidationError, run_a12
 from arx.agents.errors import AgentValidationError
 from arx.orchestration.state import DealGraphState
 
@@ -122,3 +127,89 @@ def a09_node(state: DealGraphState) -> dict:
         "document_extraction_conflicts": conflicts,
         "agent_outputs": {**state.get("agent_outputs", {}), "a09": result.output.model_dump()},
     }
+
+
+def a03_node(state: DealGraphState) -> dict:
+    try:
+        result = run_a03(
+            deal_type=state.get("deal_type", "acquisition"),
+            property_address=state["property_address"],
+            owner_name=state.get("owner_name"),
+            ownership_duration_years=state.get("ownership_duration_years"),
+            public_record_data=state.get("public_record_data"),
+            prior_contact_history=state.get("prior_contact_history"),
+        )
+    except A03ValidationError as exc:
+        return _terminated("a03", exc)
+
+    return {"agent_outputs": {**state.get("agent_outputs", {}), "a03": result.output.model_dump()}}
+
+
+def a04_node(state: DealGraphState) -> dict:
+    a02_output = state.get("agent_outputs", {}).get("a02")
+    a03_output = state.get("agent_outputs", {}).get("a03")
+    if a02_output is None:
+        raise ValueError("a04_node requires agent_outputs['a02'] to already be populated (R5)")
+    if a03_output is None:
+        raise ValueError("a04_node requires agent_outputs['a03'] to already be populated")
+
+    try:
+        result = run_a04(
+            deal_type=state.get("deal_type", "acquisition"),
+            underwriting_snapshot=a02_output,
+            seller_profile=a03_output,
+            comps=state.get("comps"),
+            feasibility_contingency_days_default=state.get("feasibility_contingency_days_default"),
+        )
+    except A04ValidationError as exc:
+        return _terminated("a04", exc)
+
+    return {"agent_outputs": {**state.get("agent_outputs", {}), "a04": result.output.model_dump()}}
+
+
+def a05_node(state: DealGraphState) -> dict:
+    a04_output = state.get("agent_outputs", {}).get("a04")
+    if a04_output is None:
+        raise ValueError("a05_node requires agent_outputs['a04'] to already be populated")
+    # Section 04: "All three to user for selection. Selected strategy -> A-05" — the
+    # human's selection is state["_selected_strategy_index"], not the whole array.
+    selected_index = state.get("_selected_strategy_index", 0)
+    selected_strategy = a04_output["strategies"][selected_index]
+
+    try:
+        result = run_a05(
+            deal_type=state.get("deal_type", "acquisition"),
+            state_code=state["state_code"],
+            selected_offer_strategy=selected_strategy,
+            org_jurisdiction=state["org_jurisdiction"],
+            non_standard_structure=state.get("non_standard_structure"),
+        )
+    except A05ValidationError as exc:
+        return _terminated("a05", exc)
+
+    return {"agent_outputs": {**state.get("agent_outputs", {}), "a05": result.output.model_dump()}}
+
+
+def a12_node(state: DealGraphState) -> dict:
+    """Standalone — Section 42: A-12 only activates when a counter-offer is received,
+    which is not a fixed next step after any other agent in this sequential flow. It
+    has no place in counterparty_offer_flow.py's linear a03->a04->a05 topology; call
+    this node directly (or via arx/api/agents.py's /agents/a12 endpoint) whenever a
+    counter actually arrives, however much later that is."""
+    a02_output = state.get("agent_outputs", {}).get("a02")
+    if a02_output is None:
+        raise ValueError("a12_node requires agent_outputs['a02'] to already be populated (R5)")
+
+    try:
+        result = run_a12(
+            original_offer_strategy=state["original_offer_strategy"],
+            seller_counter_terms=state["seller_counter_terms"],
+            underwriting_snapshot=a02_output,
+            seller_profile=state.get("agent_outputs", {}).get("a03"),
+            comparable_precedents=state.get("comparable_precedents"),
+            org_return_thresholds=state.get("org_return_thresholds"),
+        )
+    except A12ValidationError as exc:
+        return _terminated("a12", exc)
+
+    return {"agent_outputs": {**state.get("agent_outputs", {}), "a12": result.output.model_dump()}}

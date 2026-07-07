@@ -17,8 +17,13 @@ from pydantic import BaseModel
 
 from arx.agents.a01_deal_screener import A01ValidationError, run_a01
 from arx.agents.a02_underwriting_agent import A02ValidationError, run_a02
+from arx.agents.a03_seller_profiler import A03ValidationError, run_a03
+from arx.agents.a04_offer_strategy import A04ValidationError, run_a04
+from arx.agents.a05_loi_drafting import A05ValidationError, run_a05
 from arx.agents.a07_deal_memo_writer import A07ValidationError, run_a07
 from arx.agents.a09_document_intelligence import A09ValidationError, run_a09
+from arx.agents.a12_negotiation_support import A12ValidationError, run_a12
+from arx.agents.a13_capital_raise import A13ValidationError, run_a13
 from arx.agents.errors import AgentValidationError
 from arx.agents.model_client import ModelClient, model_client_dependency
 from arx.api.auth import CurrentUser, require_role
@@ -361,6 +366,312 @@ async def upload_document(
                 )
 
     return {"doc_id": str(doc_id), "snapshot_id": snapshot_id, "output": result.output.model_dump()}
+
+
+# --------------------------------------------------------------------------- A-03 ---
+
+class A03Request(BaseModel):
+    contact_id: str
+    owner_name: str | None = None
+    ownership_duration_years: float | None = None
+    public_record_data: dict | None = None
+    prior_contact_history: dict | None = None
+
+
+@router.post("/{deal_id}/agents/a03")
+def invoke_a03(
+    deal_id: str, payload: A03Request,
+    user: CurrentUser = Depends(require_role("admin", "analyst")),
+    model_client: ModelClient = Depends(model_client_dependency),
+):
+    with db_session(claims_for(user)) as conn:
+        deal = _get_deal(conn, deal_id)
+        _enforce_budget_or_raise(conn, user.org_id)
+
+        # The contact must belong to this org (RLS-scoped select, not just the FK) —
+        # otherwise a caller could log an access entry against another org's seller
+        # contact_id without ever being denied by RLS itself (FK checks in Postgres
+        # bypass RLS, so this check has to happen explicitly).
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("select contact_id from contacts where contact_id = %s", (payload.contact_id,))
+            if cur.fetchone() is None:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Contact not found")
+
+        try:
+            result = run_a03(
+                deal_type=deal["deal_type"], property_address=deal["property_address"],
+                owner_name=payload.owner_name, ownership_duration_years=payload.ownership_duration_years,
+                public_record_data=payload.public_record_data, prior_contact_history=payload.prior_contact_history,
+                model_client=model_client,
+            )
+        except A03ValidationError as exc:
+            with conn.transaction():
+                http_exc = _handle_agent_failure(conn, org_id=user.org_id, deal_id=deal_id, agent_id="a03", exc=exc)
+            raise http_exc
+
+        with conn.transaction():
+            # Section 03/25: every read of a seller profile writes to
+            # seller_profile_access_log — this is that write, in the same
+            # transaction as the snapshot so the two can never drift apart.
+            conn.execute(
+                "insert into seller_profile_access_log (contact_id, org_id, accessed_by_user_id, access_context) "
+                "values (%s, %s, %s, %s)",
+                (payload.contact_id, user.org_id, user.user_id, f"a03_profile_generated_for_deal_{deal_id}"),
+            )
+            snapshot_id = write_snapshot(
+                conn, deal_id=deal_id, org_id=user.org_id, agent_id="a03",
+                input_payload=payload.model_dump(), output_payload=result.output.model_dump(),
+                confidence_score=result.output.confidence_score, created_by_user_id=user.user_id,
+            )
+            record_agent_run(
+                conn, org_id=user.org_id, deal_id=deal_id, agent_id="a03", prompt_version=result.prompt_version,
+                confidence_score=result.output.confidence_score, validation_passed=True, failed_checks=None,
+                token_count=result.input_tokens + result.output_tokens,
+            )
+            increment_token_usage(conn, user.org_id, result.input_tokens + result.output_tokens)
+
+    return {"snapshot_id": snapshot_id, "output": result.output.model_dump()}
+
+
+# --------------------------------------------------------------------------- A-04 ---
+
+class A04Request(BaseModel):
+    seller_profile: dict
+    comps: list[dict] | None = None
+
+
+@router.post("/{deal_id}/agents/a04")
+def invoke_a04(
+    deal_id: str, payload: A04Request,
+    user: CurrentUser = Depends(require_role("admin", "analyst")),
+    model_client: ModelClient = Depends(model_client_dependency),
+):
+    """Phase 3 supports acquisition deals (reads the active A-02 snapshot). Land/
+    development deals will use A-11's snapshot once that agent lands in Phase 4 —
+    calling this for a land/development deal today 409s for the same reason A-07 does."""
+    with db_session(claims_for(user)) as conn:
+        deal = _get_deal(conn, deal_id)
+        _enforce_budget_or_raise(conn, user.org_id)
+
+        active_snapshot = get_active_snapshot(conn, deal_id=deal_id, agent_id="a02")
+        if active_snapshot is None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="No active a02 snapshot for this deal — run and activate underwriting before requesting offer strategies.",
+            )
+
+        acq_config = _get_active_uw_config(conn, user.org_id, "acquisition")
+        feasibility_default = None
+        if deal["deal_type"] in ("land", "development"):
+            dev_config = _get_active_uw_config(conn, user.org_id, "development")
+            feasibility_default = (dev_config["config"].get("land_feasibility_days") if dev_config else None)
+
+        try:
+            result = run_a04(
+                deal_type=deal["deal_type"], underwriting_snapshot=active_snapshot["output_payload"],
+                seller_profile=payload.seller_profile, comps=payload.comps,
+                feasibility_contingency_days_default=feasibility_default, model_client=model_client,
+            )
+        except A04ValidationError as exc:
+            with conn.transaction():
+                http_exc = _handle_agent_failure(conn, org_id=user.org_id, deal_id=deal_id, agent_id="a04", exc=exc)
+            raise http_exc
+
+        with conn.transaction():
+            snapshot_id = write_snapshot(
+                conn, deal_id=deal_id, org_id=user.org_id, agent_id="a04",
+                input_payload=payload.model_dump(), output_payload=result.output.model_dump(),
+                confidence_score=None, created_by_user_id=user.user_id,
+            )
+            record_agent_run(
+                conn, org_id=user.org_id, deal_id=deal_id, agent_id="a04", prompt_version=result.prompt_version,
+                confidence_score=None, validation_passed=True, failed_checks=None,
+                token_count=result.input_tokens + result.output_tokens,
+            )
+            increment_token_usage(conn, user.org_id, result.input_tokens + result.output_tokens)
+
+    return {"snapshot_id": snapshot_id, "output": result.output.model_dump()}
+
+
+# --------------------------------------------------------------------------- A-05 ---
+
+class A05Request(BaseModel):
+    state_code: str
+    selected_offer_strategy: dict
+    non_standard_structure: Literal["subject_to", "seller_financing", "complex_jv"] | None = None
+
+
+@router.post("/{deal_id}/agents/a05")
+def invoke_a05(
+    deal_id: str, payload: A05Request,
+    user: CurrentUser = Depends(require_role("admin", "analyst")),
+    model_client: ModelClient = Depends(model_client_dependency),
+):
+    with db_session(claims_for(user)) as conn:
+        deal = _get_deal(conn, deal_id)
+        _enforce_budget_or_raise(conn, user.org_id)
+
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "select * from org_jurisdictions where org_id = %s and state_code = %s",
+                (user.org_id, payload.state_code),
+            )
+            jurisdiction = cur.fetchone()
+        if jurisdiction is None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"No org_jurisdictions row configured for state '{payload.state_code}' — an Admin must "
+                       f"configure jurisdiction defaults before drafting an LOI there (Section 56).",
+            )
+
+        try:
+            result = run_a05(
+                deal_type=deal["deal_type"], state_code=payload.state_code,
+                selected_offer_strategy=payload.selected_offer_strategy, org_jurisdiction=jurisdiction,
+                non_standard_structure=payload.non_standard_structure, model_client=model_client,
+            )
+        except A05ValidationError as exc:
+            with conn.transaction():
+                http_exc = _handle_agent_failure(conn, org_id=user.org_id, deal_id=deal_id, agent_id="a05", exc=exc)
+            raise http_exc
+
+        with conn.transaction():
+            snapshot_id = write_snapshot(
+                conn, deal_id=deal_id, org_id=user.org_id, agent_id="a05",
+                input_payload=payload.model_dump(), output_payload=result.output.model_dump(),
+                confidence_score=None, created_by_user_id=user.user_id,
+            )
+            record_agent_run(
+                conn, org_id=user.org_id, deal_id=deal_id, agent_id="a05", prompt_version=result.prompt_version,
+                confidence_score=None, validation_passed=True, failed_checks=None,
+                token_count=result.input_tokens + result.output_tokens,
+            )
+            increment_token_usage(conn, user.org_id, result.input_tokens + result.output_tokens)
+
+    return {"snapshot_id": snapshot_id, "output": result.output.model_dump()}
+
+
+# --------------------------------------------------------------------------- A-12 ---
+
+class A12Request(BaseModel):
+    original_offer_strategy: dict
+    seller_counter_terms: dict
+    seller_profile: dict | None = None
+    comparable_precedents: list[dict] | None = None
+    org_return_thresholds: dict | None = None
+
+
+@router.post("/{deal_id}/agents/a12")
+def invoke_a12(
+    deal_id: str, payload: A12Request,
+    user: CurrentUser = Depends(require_role("admin", "analyst")),
+    model_client: ModelClient = Depends(model_client_dependency),
+):
+    with db_session(claims_for(user)) as conn:
+        _get_deal(conn, deal_id)
+        _enforce_budget_or_raise(conn, user.org_id)
+
+        active_snapshot = get_active_snapshot(conn, deal_id=deal_id, agent_id="a02")
+        if active_snapshot is None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="No active a02 snapshot for this deal — negotiation support requires the deal's underwriting.",
+            )
+
+        try:
+            result = run_a12(
+                original_offer_strategy=payload.original_offer_strategy,
+                seller_counter_terms=payload.seller_counter_terms,
+                underwriting_snapshot=active_snapshot["output_payload"],
+                seller_profile=payload.seller_profile, comparable_precedents=payload.comparable_precedents,
+                org_return_thresholds=payload.org_return_thresholds, model_client=model_client,
+            )
+        except A12ValidationError as exc:
+            with conn.transaction():
+                http_exc = _handle_agent_failure(conn, org_id=user.org_id, deal_id=deal_id, agent_id="a12", exc=exc)
+            raise http_exc
+
+        with conn.transaction():
+            snapshot_id = write_snapshot(
+                conn, deal_id=deal_id, org_id=user.org_id, agent_id="a12",
+                input_payload=payload.model_dump(), output_payload=result.output.model_dump(),
+                confidence_score=None, created_by_user_id=user.user_id,
+            )
+            record_agent_run(
+                conn, org_id=user.org_id, deal_id=deal_id, agent_id="a12", prompt_version=result.prompt_version,
+                confidence_score=None, validation_passed=True, failed_checks=None,
+                token_count=result.input_tokens + result.output_tokens,
+            )
+            increment_token_usage(conn, user.org_id, result.input_tokens + result.output_tokens)
+
+    return {"snapshot_id": snapshot_id, "output": result.output.model_dump()}
+
+
+# --------------------------------------------------------------------------- A-13 ---
+
+class A13Request(BaseModel):
+    equity_needed: float | None = None
+
+
+@router.post("/{deal_id}/agents/a13")
+def invoke_a13(
+    deal_id: str, payload: A13Request,
+    user: CurrentUser = Depends(require_role("admin", "analyst")),
+    model_client: ModelClient = Depends(model_client_dependency),
+):
+    with db_session(claims_for(user)) as conn:
+        deal = _get_deal(conn, deal_id)
+        _enforce_budget_or_raise(conn, user.org_id)
+
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("select * from lp_profiles where org_id = %s", (user.org_id,))
+            lp_profiles = cur.fetchall()
+
+            # Section 26 (Feedback Loop Engine) and Section 58 (Comp & Precedent
+            # Library) — which would populate real total_equity_deployed /
+            # avg_return_vs_projection / strongest_precedent from closed-deal
+            # performance — are Phase 5 work. deals_closed is real; the rest is left
+            # unknown rather than estimated (N3: never fabricate).
+            cur.execute(
+                "select count(*) as n from deals where org_id = %s and status = 'closed'", (user.org_id,)
+            )
+            deals_closed = cur.fetchone()["n"]
+
+        org_deal_history = {
+            "deals_closed": deals_closed,
+            "total_equity_deployed": 0.0,
+            "avg_return_vs_projection": None,
+            "strongest_precedent": None,
+        }
+        deal_context = {
+            "deal_id": deal_id, "asset_type": deal["asset_type"], "deal_type": deal["deal_type"],
+            "equity_needed": payload.equity_needed,
+        }
+
+        try:
+            result = run_a13(
+                deal_context=deal_context, lp_profiles=lp_profiles, org_deal_history=org_deal_history,
+                model_client=model_client,
+            )
+        except A13ValidationError as exc:
+            with conn.transaction():
+                http_exc = _handle_agent_failure(conn, org_id=user.org_id, deal_id=deal_id, agent_id="a13", exc=exc)
+            raise http_exc
+
+        with conn.transaction():
+            snapshot_id = write_snapshot(
+                conn, deal_id=deal_id, org_id=user.org_id, agent_id="a13",
+                input_payload=payload.model_dump(), output_payload=result.output.model_dump(),
+                confidence_score=None, created_by_user_id=user.user_id,
+            )
+            record_agent_run(
+                conn, org_id=user.org_id, deal_id=deal_id, agent_id="a13", prompt_version=result.prompt_version,
+                confidence_score=None, validation_passed=True, failed_checks=None,
+                token_count=result.input_tokens + result.output_tokens,
+            )
+            increment_token_usage(conn, user.org_id, result.input_tokens + result.output_tokens)
+
+    return {"snapshot_id": snapshot_id, "output": result.output.model_dump()}
 
 
 def _extract_text(filename: str, file_bytes: bytes) -> str:

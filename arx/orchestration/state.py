@@ -69,3 +69,25 @@ class DealGraphState(TypedDict, total=False):
     # A-09 (arx/orchestration/nodes.py:a09_node) processes one document per node
     # invocation; the caller sets this before running the node.
     _current_document: dict | None
+
+    # Phase 3 — Counterparty + Offer Layer (Section 07). A-03/A-04/A-05 inputs; a12 is
+    # a separate on-demand re-entry point (Section 42: only activates when a counter
+    # is received), not part of this sequential flow — see counterparty_offer_flow.py.
+    owner_name: str | None
+    ownership_duration_years: float | None
+    public_record_data: dict | None
+    prior_contact_history: dict | None
+
+    feasibility_contingency_days_default: int | None
+
+    state_code: str
+    org_jurisdiction: dict
+    non_standard_structure: str | None
+    # Which of A-04's 3 strategies (index 0/1/2) the human selected for A-05 to draft.
+    _selected_strategy_index: int
+
+    # A-12 inputs (standalone — see arx/orchestration/nodes.py:a12_node docstring).
+    original_offer_strategy: dict
+    seller_counter_terms: dict
+    comparable_precedents: list[dict] | None
+    org_return_thresholds: dict | None

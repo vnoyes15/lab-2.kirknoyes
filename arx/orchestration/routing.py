@@ -7,9 +7,26 @@ wire in as LangGraph conditional-edge callables once A-01 and A-09 land in Phase
 the routing *decision* is separable from the agent that produces the inputs to it, so
 it can be built and tested now.
 """
-from typing import Literal
+from typing import Callable, Literal
 
 from arx.orchestration.state import AgentId, DealGraphState
+
+
+def route_unless_terminated(next_node: AgentId) -> Callable[[DealGraphState], str]:
+    """Generic conditional-edge factory: proceed to next_node unless the previous
+    node set state["terminated"] = True (arx/orchestration/nodes.py's _terminated()
+    helper does this on any AgentValidationError). Without this, a plain
+    graph.add_edge would run the next node anyway and crash on missing inputs — this
+    is exactly the bug that surfaced in counterparty_offer_flow.py during testing:
+    an a03 validation failure still fell through into a04_node, which then raised a
+    confusing ValueError about a missing a03 output instead of halting cleanly.
+    """
+    def _route(state: DealGraphState) -> str:
+        from langgraph.graph import END
+        if state.get("terminated"):
+            return END
+        return next_node
+    return _route
 
 
 def needs_document_processing(state: DealGraphState) -> bool:
