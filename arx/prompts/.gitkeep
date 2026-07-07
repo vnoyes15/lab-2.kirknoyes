@@ -1,0 +1,2 @@
+# Arx IP. Versioned prompt YAML per agent, one folder per agent (a01/ ... a13/), starting Phase 2.
+# Never hardcode a prompt string in Python source. Never commit unencrypted to a public repo (Section 86).
