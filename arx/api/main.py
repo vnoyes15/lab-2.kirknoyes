@@ -14,6 +14,8 @@ from arx.api import (
     errors,
     lender_package,
     lp,
+    market_signals,
+    network_intelligence,
     notifications,
     pipeline,
     portfolio,
@@ -50,6 +52,8 @@ app.include_router(attorney.router)
 app.include_router(attorney.deals_router)
 app.include_router(lender_package.router)
 app.include_router(data_portability.router)
+app.include_router(market_signals.router)
+app.include_router(network_intelligence.router)
 
 
 @app.get("/healthz", tags=["ops"])

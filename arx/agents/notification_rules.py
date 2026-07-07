@@ -195,6 +195,22 @@ def disposition_opportunity_notification(
     )
 
 
+def market_signal_deal_impact_notification(
+    *, property_address: str, signal_type: str, submarket: str, change_pct: float | None,
+) -> NotificationSpec:
+    """Section 62: "When a market_signals record is created with significance = high...
+    For each affected deal:... triggers deal risk monitor notification." Fires once
+    per affected deal, not once per signal — the caller iterates affected deals and
+    calls this per deal."""
+    change_note = f" ({change_pct * 100:+.1f}%)" if change_pct is not None else ""
+    return NotificationSpec(
+        notification_type="market_signal_deal_impact", severity="warning",
+        title=f"Market signal affects this deal: {property_address}",
+        body=f"A high-significance {signal_type} signal in {submarket}{change_note} may affect this deal's "
+             f"underwriting assumptions — worth a review.",
+    )
+
+
 def daily_send_limit_reached_notification(*, daily_send_limit: int) -> NotificationSpec:
     """Fires when A-08 raises A08DailyLimitError (arx/agents/a08_outreach.py) — org-wide
     (no specific deal), so the caller passes deal_id=None to create_notification."""
