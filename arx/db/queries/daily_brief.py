@@ -18,14 +18,29 @@ they're approximated and documented rather than fabricated:
     currently in 'due_diligence'.
   - "Top 3 new leads" — Section 36's motivated-seller-score lead queue is Phase 6+
     automation; approximated as the 3 most recently created status='lead' deals.
+
+Section 51's "missing required fields for next stage surface in daily brief as
+deal-specific action items" and Section 76 FL2's "Arx prompts for monthly actuals in
+the daily brief on the 5th of each month for all owned assets" are both folded in
+here rather than left as separate reports nobody actually looks at.
 """
+from datetime import date
+
 import psycopg
 from psycopg.rows import dict_row
 
 from arx.agents.notification_rules import MOMENTUM_STALLED_THRESHOLD
+from arx.db.queries.data_quality import get_missing_required_fields_action_items
+
+# Section 76 FL2: "on the 5th of each month" — the daily brief only carries the
+# monthly-actuals prompt on that one day, not every day of the month.
+MONTHLY_ACTUALS_PROMPT_DAY = 5
 
 
-def build_daily_brief(conn: psycopg.Connection, *, org_id: str, user_id: str, role: str) -> dict:
+def build_daily_brief(
+    conn: psycopg.Connection, *, org_id: str, user_id: str, role: str, today: date | None = None,
+) -> dict:
+    today = today or date.today()
     deal_scope_sql = "org_id = %(org_id)s"
     params = {"org_id": org_id, "user_id": user_id}
     if role != "admin":
@@ -95,6 +110,19 @@ def build_daily_brief(conn: psycopg.Connection, *, org_id: str, user_id: str, ro
             development_milestone_status = []
             construction_budget_variance = []
 
+        monthly_actuals_prompt = []
+        if today.day == MONTHLY_ACTUALS_PROMPT_DAY:
+            cur.execute(
+                "select deal_id, property_address from deals "
+                "where org_id = %(org_id)s and is_acquired = true "
+                "and deal_id not in ("
+                "  select deal_id from deal_performance "
+                "  where period >= date_trunc('month', %(today)s::date - interval '1 month')"
+                ")",
+                {"org_id": org_id, "today": today},
+            )
+            monthly_actuals_prompt = cur.fetchall()
+
     stalled_deals = [d for d in active_deals if (d["momentum_score"] or 0) < MOMENTUM_STALLED_THRESHOLD]
     dd_countdowns = [
         {"deal_id": d["deal_id"], "property_address": d["property_address"],
@@ -113,6 +141,13 @@ def build_daily_brief(conn: psycopg.Connection, *, org_id: str, user_id: str, ro
         if action is not None:
             recommended_next_actions.append({"deal_id": deal["deal_id"], "recommendation": action})
 
+    missing_required_fields_action_items = get_missing_required_fields_action_items(conn, org_id)
+    if role != "admin":
+        deal_id_set = set(deal_ids)
+        missing_required_fields_action_items = [
+            item for item in missing_required_fields_action_items if item["deal_id"] in deal_id_set
+        ]
+
     return {
         "deal_activity_summary": {"deals_with_activity_last_24h": deal_activity_count, "total_active_deals": len(active_deals)},
         "stalled_deal_alerts": stalled_deals,
@@ -124,6 +159,8 @@ def build_daily_brief(conn: psycopg.Connection, *, org_id: str, user_id: str, ro
         "blocked_tasks": blocked_tasks,
         "construction_budget_variance": construction_budget_variance,
         "recommended_next_actions": recommended_next_actions,
+        "data_quality_action_items": missing_required_fields_action_items,
+        "monthly_actuals_prompt": monthly_actuals_prompt,
     }
 
 

@@ -9,6 +9,7 @@ from arx.api import (
     audit,
     daily_brief,
     data_portability,
+    data_quality,
     deals,
     equity_waterfall,
     errors,
@@ -54,6 +55,7 @@ app.include_router(lender_package.router)
 app.include_router(data_portability.router)
 app.include_router(market_signals.router)
 app.include_router(network_intelligence.router)
+app.include_router(data_quality.router)
 
 
 @app.get("/healthz", tags=["ops"])
