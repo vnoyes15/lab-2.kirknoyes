@@ -8,6 +8,7 @@ from arx.api import (
     audit,
     daily_brief,
     deals,
+    equity_waterfall,
     errors,
     lp,
     notifications,
@@ -41,6 +42,7 @@ app.include_router(daily_brief.router)
 app.include_router(errors.router)
 app.include_router(risk.router)
 app.include_router(refi_disposition.router)
+app.include_router(equity_waterfall.router)
 
 
 @app.get("/healthz", tags=["ops"])
