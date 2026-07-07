@@ -37,6 +37,7 @@ from arx.agents.a13_capital_raise import A13ValidationError, run_a13
 from arx.agents.errors import AgentValidationError
 from arx.agents.model_client import ModelClient, model_client_dependency
 from arx.agents.notification_rules import (
+    accuracy_flag_threshold_notification,
     daily_send_limit_reached_notification,
     deal_advancement_blocked_notification,
 )
@@ -45,7 +46,13 @@ from arx.api.deps import claims_for
 from arx.db.connection import db_session
 from arx.db.queries.cost_controls import check_budget, increment_token_usage
 from arx.db.queries.quality_log import record_agent_run, record_error
-from arx.db.queries.snapshots import activate_snapshot, get_active_snapshot, write_snapshot
+from arx.db.queries.snapshots import (
+    activate_snapshot,
+    count_recent_inaccurate_flags,
+    get_active_snapshot,
+    set_accuracy_flag,
+    write_snapshot,
+)
 from arx.notifications.channels import InAppChannel
 
 router = APIRouter(prefix="/api/v1/deals", tags=["agents"])
@@ -245,6 +252,45 @@ def activate_agent_snapshot(
         with conn.transaction():
             activate_snapshot(conn, deal_id=deal_id, agent_id=agent_id, snapshot_id=snapshot_id)
     return {"deal_id": deal_id, "agent_id": agent_id, "active_snapshot_id": snapshot_id}
+
+
+# ------------------------------------------------------------- output accuracy flagging ---
+
+class AccuracyFlagRequest(BaseModel):
+    accuracy_flag: Literal["accurate", "partial", "inaccurate"]
+    accuracy_note: str | None = None
+
+
+@router.patch("/{deal_id}/agents/{agent_id}/snapshots/{snapshot_id}/accuracy")
+def flag_snapshot_accuracy(
+    deal_id: str, agent_id: str, snapshot_id: str, payload: AccuracyFlagRequest,
+    user: CurrentUser = Depends(require_role("admin", "analyst")),
+):
+    """Section 35 — Output Accuracy Flagging. "Creates a defensible decision record —
+    evidence that every agent output was reviewed by a human professional before being
+    acted upon." 3 'inaccurate' flags on the same agent within 30 days -> Admin
+    notification recommending prompt review."""
+    with db_session(claims_for(user)) as conn:
+        with conn.transaction():
+            updated = set_accuracy_flag(
+                conn, snapshot_id=snapshot_id, accuracy_flag=payload.accuracy_flag,
+                accuracy_note=payload.accuracy_note,
+            )
+            if updated is None:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Snapshot not found")
+
+            if payload.accuracy_flag == "inaccurate":
+                recent_count = count_recent_inaccurate_flags(conn, org_id=user.org_id, agent_id=agent_id)
+                spec = accuracy_flag_threshold_notification(
+                    agent_id=agent_id, recent_inaccurate_count=recent_count,
+                )
+                if spec is not None:
+                    InAppChannel().send(conn, org_id=user.org_id, spec=spec, deal_id=deal_id)
+
+    return {
+        "snapshot_id": snapshot_id, "accuracy_flag": updated["accuracy_flag"],
+        "accuracy_note": updated["accuracy_note"],
+    }
 
 
 # --------------------------------------------------------------------------- A-07 ---

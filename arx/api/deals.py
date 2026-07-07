@@ -11,6 +11,12 @@ guarantee holds even under two concurrent intake calls for the same address.
 Not yet implemented (later phases, noted so nobody mistakes silence for an oversight):
   - Documents attached to intake triggering A-09 automatically (R6, Phase 2).
   - Geocoding property_address -> lat/lng (Section 19, Phase 4 per VL5).
+
+PATCH /{deal_id}/status — Section 23: "Each stage transition requires timestamp and
+user." Nothing before Phase 5 ever transitioned a deal's status at all (deals were
+created and left at 'lead' forever); this is the first place deal_status_history
+(arx/db/migrations/029_deal_status_history.sql) gets written, which Section 20's
+pipeline analytics ("average days per stage") depends on.
 """
 from typing import Literal
 
@@ -22,11 +28,18 @@ from pydantic import BaseModel, Field
 from arx.api.auth import CurrentUser, require_role
 from arx.api.deps import claims_for
 from arx.db.connection import db_session
-from arx.db.queries.pipeline import get_pipeline_view
 
 router = APIRouter(prefix="/api/v1/deals", tags=["deals"])
 
 DealType = Literal["acquisition", "land", "development"]
+DEAL_STATUSES = (
+    "lead", "screened", "feasibility_study", "underwriting", "loi", "under_contract",
+    "due_diligence", "entitlement", "construction", "lease_up", "stabilized", "closed", "dead",
+)
+CLOSE_REASON_CODES = (
+    "seller_declined_offer", "deal_failed_underwriting", "financing_unavailable",
+    "due_diligence_failed", "entitlement_failed", "construction_cost_infeasible", "other",
+)
 
 
 class DealIntakeRequest(BaseModel):
@@ -84,6 +97,11 @@ def create_deal(
                         },
                     )
                     row = cur.fetchone()
+                    cur.execute(
+                        "insert into deal_status_history (deal_id, org_id, status, changed_by_user_id) "
+                        "values (%s, %s, 'lead', %s)",
+                        (row["deal_id"], user.org_id, user.user_id),
+                    )
                 return DealIntakeResponse(deal_id=str(row["deal_id"]), created=True)
             except psycopg_errors.UniqueViolation:
                 cur.execute(
@@ -105,16 +123,46 @@ def create_deal(
                 return DealIntakeResponse(deal_id=str(row["deal_id"]), created=False)
 
 
-@router.get("/pipeline")
-def pipeline_view(user: CurrentUser = Depends(require_role("admin", "analyst", "viewer"))) -> list[dict]:
-    """Section 06/23: every non-dead deal for the caller's org, grouped into pipeline
-    stage order with momentum_score/days_in_current_status attached (see
-    arx/db/queries/pipeline.py, arx/agents/momentum_scoring.py). Scores reflect
-    whatever arx.tasks.momentum_scorer's last nightly run computed — this endpoint
-    reads, it never recomputes inline (that stays a background-job concern, not
-    request-latency work)."""
+class DealStatusUpdateRequest(BaseModel):
+    status: Literal[DEAL_STATUSES]
+    close_reason_code: Literal[CLOSE_REASON_CODES] | None = None
+
+
+@router.patch("/{deal_id}/status")
+def update_deal_status(
+    deal_id: str, payload: DealStatusUpdateRequest,
+    user: CurrentUser = Depends(require_role("admin", "analyst")),
+) -> dict:
+    if payload.status == "dead" and payload.close_reason_code is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="close_reason_code is required when status is 'dead' (Section 23)",
+        )
+
     with db_session(claims_for(user)) as conn:
-        return get_pipeline_view(conn, user.org_id)
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("select status from deals where deal_id = %s", (deal_id,))
+            deal = cur.fetchone()
+        if deal is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Deal not found")
+
+        with conn.transaction():
+            conn.execute(
+                "update deal_status_history set exited_at = now() "
+                "where deal_id = %s and exited_at is null",
+                (deal_id,),
+            )
+            conn.execute(
+                "update deals set status = %s, close_reason_code = %s where deal_id = %s",
+                (payload.status, payload.close_reason_code, deal_id),
+            )
+            conn.execute(
+                "insert into deal_status_history (deal_id, org_id, status, changed_by_user_id) "
+                "values (%s, %s, %s, %s)",
+                (deal_id, user.org_id, payload.status, user.user_id),
+            )
+
+    return {"deal_id": deal_id, "status": payload.status}
 
 
 @router.get("/{deal_id}")

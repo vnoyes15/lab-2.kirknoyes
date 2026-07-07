@@ -11,6 +11,12 @@ triggering fact the caller already has in hand.
 from dataclasses import dataclass, asdict
 
 MOMENTUM_STALLED_THRESHOLD = 20
+ACCURACY_FLAG_ADMIN_THRESHOLD = 3
+# Section 49: "Milestone delay notifications fire to LP users when schedule slips
+# beyond defined thresholds" — no exact day count is given in the spec; 14 days is a
+# ZONIQ operating-cadence assumption, same category as momentum_scoring.py's
+# documented thresholds.
+MILESTONE_DELAY_THRESHOLD_DAYS = 14
 
 
 @dataclass(frozen=True)
@@ -65,6 +71,42 @@ def momentum_stalled_notification(
                  f"no recent activity and/or stuck in its current status.",
         )
     return None
+
+
+def accuracy_flag_threshold_notification(*, agent_id: str, recent_inaccurate_count: int) -> NotificationSpec | None:
+    """Section 35: '3 inaccurate flags on the same agent within 30 days triggers Admin
+    notification recommending prompt review.' Fires every time the count is at or
+    above threshold (unlike momentum_stalled_notification's one-time transition alert)
+    — each new inaccurate flag past the threshold is itself new information an Admin
+    should see, not a repeat of the same alert."""
+    if recent_inaccurate_count < ACCURACY_FLAG_ADMIN_THRESHOLD:
+        return None
+    return NotificationSpec(
+        notification_type="accuracy_flag_threshold",
+        severity="critical",
+        title=f"Agent {agent_id}: {recent_inaccurate_count} inaccurate outputs flagged in 30 days",
+        body=f"Agent '{agent_id}' has been flagged 'inaccurate' {recent_inaccurate_count} times in the "
+             f"last 30 days (threshold: {ACCURACY_FLAG_ADMIN_THRESHOLD}). Recommend prompt review (Section 35).",
+        source_agent=agent_id,
+    )
+
+
+def milestone_delay_notification(
+    *, property_address: str, milestone_type: str, variance_days: int | None,
+) -> NotificationSpec | None:
+    """Fires when a development milestone's variance_days (actual_date - projected_date,
+    computed by the caller) exceeds MILESTONE_DELAY_THRESHOLD_DAYS. Recipients are the
+    deal's LP users specifically (Section 49), not the org broadly — the caller sends
+    one notification per deal_lp_access row rather than an org-wide one."""
+    if variance_days is None or variance_days <= MILESTONE_DELAY_THRESHOLD_DAYS:
+        return None
+    return NotificationSpec(
+        notification_type="milestone_delay",
+        severity="warning",
+        title=f"Milestone delayed: {property_address}",
+        body=f"'{milestone_type}' is running {variance_days} days behind schedule "
+             f"(threshold: {MILESTONE_DELAY_THRESHOLD_DAYS} days).",
+    )
 
 
 def daily_send_limit_reached_notification(*, daily_send_limit: int) -> NotificationSpec:

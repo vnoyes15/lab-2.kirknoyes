@@ -1,13 +1,15 @@
-"""Gate G-08 (Phase 2 subset) — Section 14: "A-09 correctly extracts required fields
-from 5 real CRE documents with no fabricated data and structured errors for missing
-fields."
+"""Gate G-08 — Section 14: "A-09 correctly extracts required fields from 5 real CRE
+documents with no fabricated data and structured errors for missing fields."
 
-Five documents spanning the types A-09 supports (Section 09 SUPPORTED DOCUMENTS): a
-rent roll (via the deterministic parser, no model), and four model-routed types (OM,
-lease, environmental, appraisal) using realistic excerpted text. Each assertion checks
-two things Section 09/67 both insist on: (1) fields present in the source document are
+No real ZONIQ production documents exist in this environment — same documented gap as
+G-01's synthetic stand-in (arx/tests/test_gate_g01_end_to_end.py). Five documents
+spanning the types A-09 supports (Section 09 SUPPORTED DOCUMENTS): a rent roll (via
+the deterministic parser, no model), and four model-routed types (OM, lease,
+environmental, appraisal) using realistic excerpted text. Each assertion checks two
+things Section 09/67 both insist on: (1) fields present in the source document are
 extracted, (2) fields NOT in the source are never fabricated — they show up in
-missing_required_fields instead of a guessed value.
+missing_required_fields instead of a guessed value. Written in Phase 2; this is the
+full gate, not a subset — nothing here changed for Phase 5.
 """
 import pytest
 

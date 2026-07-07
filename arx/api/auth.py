@@ -1,8 +1,17 @@
-"""Auth & role enforcement — Section 09.
+"""Auth & role enforcement — Section 09 + Section 49.
 
-Three roles: Admin (full access, billing, config), Analyst (run agents, create deals,
+Section 09 (Tier 2, written before the v1.5 LP Trust Layer addition) names three
+roles: Admin (full access, billing, config), Analyst (run agents, create deals,
 no billing/settings), Viewer (read-only — deal memos and underwriting only, no seller
-profiles).
+profiles). Section 49 (v1.5, Tier 4) then introduces a fourth: "LP Viewer role scoped
+to specific deals via deal_lp_access table... Zero cross-deal visibility." An LP is
+architecturally distinct from the org's own internal Viewer role — a Viewer sees every
+deal in the org (minus seller profiles); an LP is an external investor who must see
+*only* the specific deal(s) they're invested in, and only the LP-visible subset of
+fields on those (Section 49: LP-hidden covers seller profiles, internal comments,
+assumption overrides, offer strategy details). Modeling "lp" as its own role rather
+than a restricted Viewer keeps that hard boundary in the role check itself rather than
+relying on every LP-facing endpoint to remember an extra filter.
 
 MT3: "Role enforcement at API layer regardless of front end. Viewer token on agent
 endpoint = 403." This module is that enforcement point — every router dependency-injects
@@ -30,8 +39,8 @@ from arx.api.config import get_settings
 
 security = HTTPBearer()
 
-Role = str  # "admin" | "analyst" | "viewer"
-VALID_ROLES: tuple[Role, ...] = ("admin", "analyst", "viewer")
+Role = str  # "admin" | "analyst" | "viewer" | "lp"
+VALID_ROLES: tuple[Role, ...] = ("admin", "analyst", "viewer", "lp")
 
 
 @dataclass(frozen=True)
