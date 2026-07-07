@@ -5,6 +5,7 @@ from fastapi import FastAPI
 
 from arx.api import (
     agents,
+    attorney,
     audit,
     daily_brief,
     deals,
@@ -43,6 +44,8 @@ app.include_router(errors.router)
 app.include_router(risk.router)
 app.include_router(refi_disposition.router)
 app.include_router(equity_waterfall.router)
+app.include_router(attorney.router)
+app.include_router(attorney.deals_router)
 
 
 @app.get("/healthz", tags=["ops"])
