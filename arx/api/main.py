@@ -11,6 +11,7 @@ from arx.api import (
     deals,
     equity_waterfall,
     errors,
+    lender_package,
     lp,
     notifications,
     pipeline,
@@ -46,6 +47,7 @@ app.include_router(refi_disposition.router)
 app.include_router(equity_waterfall.router)
 app.include_router(attorney.router)
 app.include_router(attorney.deals_router)
+app.include_router(lender_package.router)
 
 
 @app.get("/healthz", tags=["ops"])
