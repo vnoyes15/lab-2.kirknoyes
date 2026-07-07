@@ -20,6 +20,7 @@ from psycopg.rows import dict_row
 from pydantic import BaseModel, Field
 
 from arx.api.auth import CurrentUser, require_role
+from arx.api.deps import claims_for
 from arx.db.connection import db_session
 
 router = APIRouter(prefix="/api/v1/deals", tags=["deals"])
@@ -44,10 +45,6 @@ class DealIntakeResponse(BaseModel):
     created: bool  # False when this call deduplicated onto an existing deal
 
 
-def _claims(user: CurrentUser) -> dict:
-    return {"org_id": user.org_id, "role": user.role, "sub": user.user_id}
-
-
 @router.post("/intake", response_model=DealIntakeResponse, status_code=status.HTTP_201_CREATED)
 def create_deal(
     payload: DealIntakeRequest,
@@ -62,7 +59,7 @@ def create_deal(
             detail="org_id in request body must match the authenticated session's org",
         )
 
-    with db_session(_claims(user)) as conn:
+    with db_session(claims_for(user)) as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             try:
                 with conn.transaction():
@@ -109,7 +106,7 @@ def create_deal(
 
 @router.get("/{deal_id}")
 def get_deal(deal_id: str, user: CurrentUser = Depends(require_role("admin", "analyst", "viewer"))):
-    with db_session(_claims(user)) as conn:
+    with db_session(claims_for(user)) as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute("select * from deals where deal_id = %s", (deal_id,))
             row = cur.fetchone()

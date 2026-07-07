@@ -18,11 +18,22 @@ from contextlib import contextmanager
 from typing import Iterator
 
 import psycopg
+from psycopg.types.numeric import FloatLoader
 from psycopg_pool import ConnectionPool
 
 from arx.api.config import get_settings
 
 _pool: ConnectionPool | None = None
+
+
+def _configure_connection(conn: psycopg.Connection) -> None:
+    # Postgres `numeric` loads as decimal.Decimal by default. Every agent schema
+    # (Section 87) and validation suite (Section 15) works in plain float — a
+    # Decimal quietly reaching arithmetic against a float (e.g. purchase_price * ltv)
+    # raises TypeError instead of computing. Registering this once here, for every
+    # connection the app pool hands out, is simpler and safer than remembering to
+    # float() every numeric column at every call site.
+    conn.adapters.register_loader("numeric", FloatLoader)
 
 
 def get_pool() -> ConnectionPool:
@@ -31,7 +42,10 @@ def get_pool() -> ConnectionPool:
         settings = get_settings()
         # app_database_url, never database_url — see arx/api/config.py's field docs.
         # A superuser/BYPASSRLS connection here would make every RLS policy a no-op.
-        _pool = ConnectionPool(settings.app_database_url, min_size=1, max_size=10, open=True)
+        _pool = ConnectionPool(
+            settings.app_database_url, min_size=1, max_size=10, open=True,
+            configure=_configure_connection,
+        )
     return _pool
 
 

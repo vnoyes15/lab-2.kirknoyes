@@ -35,6 +35,11 @@ ACQUISITION_DEFAULTS = {
     "ltv": 0.75,
     "interest_rate": 0.065,
     "amortization_years": 30,
+    # Section 01: "ZONIQ cap rate target 5.5% – 6.5%". A-01 reads this to judge
+    # in_target_range. No equivalent development ROC target is given anywhere in the
+    # build brief, so none is fabricated here — development target range setup is
+    # deferred to whichever org first configures it (A-10/A-11 land in Phase 4 anyway).
+    "target_cap_rate_range": [0.055, 0.065],
 }
 
 # Section 10 (A-11 KEY DEFAULTS).

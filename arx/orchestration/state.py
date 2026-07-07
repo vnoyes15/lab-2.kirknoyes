@@ -41,3 +41,31 @@ class DealGraphState(TypedDict, total=False):
     next_agent: AgentId | None
     terminated: bool
     termination_reason: str | None
+
+    # Deal facts fed to A-01/A-02 (Section 87 inputs) — populated by whoever invokes
+    # the graph (Phase 2: arx/api/agents.py reads these from the deals/uw_config
+    # tables; Phase 5's autonomous graph would populate them itself).
+    property_address: str
+    asking_price: float | None
+    unit_count: int | None
+    land_area_sf: float | None
+    current_gross_rent: float | None
+    intended_use: str | None
+    target_cap_rate_range: tuple[float, float] | None
+    target_roc_range: tuple[float, float] | None
+
+    purchase_price: float
+    asset_type: str
+    submarket: str
+    uw_defaults: dict
+    loan_amount: float
+    ltv: float
+    interest_rate: float
+    amortization_years: int
+    comps: list[dict] | None
+
+    audience_version: str
+
+    # A-09 (arx/orchestration/nodes.py:a09_node) processes one document per node
+    # invocation; the caller sets this before running the node.
+    _current_document: dict | None

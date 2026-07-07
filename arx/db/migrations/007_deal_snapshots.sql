@@ -58,6 +58,10 @@ create trigger trg_deal_snapshots_immutable
     before update on deal_snapshots
     for each row execute function arx_enforce_snapshot_immutability();
 
+-- Amended by 023_amend_snapshot_delete_guard.sql to allow an explicit, session-scoped
+-- opt-in for deliberate administrative purges (org offboarding, GDPR deletion, test
+-- teardown) — the unconditional version below blocked even a cascade delete from the
+-- parent org/deal, making it impossible to ever remove an org that had any snapshots.
 create or replace function arx_block_snapshot_delete() returns trigger as $$
 begin
     raise exception 'deal_snapshots rows are never deleted (snapshot_id=%)', old.snapshot_id;
