@@ -109,6 +109,37 @@ def milestone_delay_notification(
     )
 
 
+def task_assigned_notification(*, title: str, property_address: str, source_agent: str | None) -> NotificationSpec:
+    """Section 73: "Assigned users receive notification on task creation." Fires for
+    both agent-created tasks (A-06's DD checklist, source_agent='a06') and manually
+    created ones (source_agent=None)."""
+    return NotificationSpec(
+        notification_type="task_assigned",
+        severity="info",
+        title=f"New task assigned: {property_address}",
+        body=f'You\'ve been assigned a task: "{title}".',
+        source_agent=source_agent,
+    )
+
+
+def error_on_active_deal_notification(
+    *, property_address: str, error_type: str, agent_id: str | None, deal_status: str,
+) -> NotificationSpec | None:
+    """Section 78 EP1: "Admin notified immediately for errors on deals in active
+    stages." 'Active' here means not yet closed or dead — an error on a deal that's
+    already done doesn't need an urgent Admin ping."""
+    if deal_status in ("closed", "dead"):
+        return None
+    return NotificationSpec(
+        notification_type="error_on_active_deal",
+        severity="critical",
+        title=f"Agent error on active deal: {property_address}",
+        body=f"An unrecoverable error ({error_type}) occurred"
+             + (f" in agent '{agent_id}'" if agent_id else "") + f" while the deal was in '{deal_status}'.",
+        source_agent=agent_id,
+    )
+
+
 def daily_send_limit_reached_notification(*, daily_send_limit: int) -> NotificationSpec:
     """Fires when A-08 raises A08DailyLimitError (arx/agents/a08_outreach.py) — org-wide
     (no specific deal), so the caller passes deal_id=None to create_notification."""

@@ -25,11 +25,14 @@ from psycopg import errors as psycopg_errors
 from psycopg.rows import dict_row
 from pydantic import BaseModel, Field
 
+from arx.agents.notification_rules import task_assigned_notification
 from arx.api.auth import CurrentUser, require_role
 from arx.api.deps import claims_for
 from arx.db.connection import db_session
+from arx.notifications.channels import InAppChannel
 
 router = APIRouter(prefix="/api/v1/deals", tags=["deals"])
+TASK_PRIORITIES = ("low", "medium", "high")
 
 DealType = Literal["acquisition", "land", "development"]
 DEAL_STATUSES = (
@@ -146,6 +149,27 @@ def update_deal_status(
         if deal is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Deal not found")
 
+        if payload.status == "closed":
+            # Section 73: "A deal cannot advance from due_diligence to closed while
+            # any task with priority = high has status = not_started or in_progress.
+            # Enforced at the API layer — not a UI suggestion." Nothing before Phase 6
+            # ever enforced this despite deal_tasks/status existing since Phase 2/4.
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    "select task_id, title from deal_tasks where deal_id = %s and priority = 'high' "
+                    "and status in ('not_started', 'in_progress')",
+                    (deal_id,),
+                )
+                blocking_tasks = cur.fetchall()
+            if blocking_tasks:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail={
+                        "message": "Deal cannot advance to closed while high-priority tasks are open (Section 73)",
+                        "blocking_tasks": [{"task_id": str(t["task_id"]), "title": t["title"]} for t in blocking_tasks],
+                    },
+                )
+
         with conn.transaction():
             conn.execute(
                 "update deal_status_history set exited_at = now() "
@@ -177,3 +201,66 @@ def get_deal(deal_id: str, user: CurrentUser = Depends(require_role("admin", "an
         # message differences).
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Deal not found")
     return row
+
+
+class DealTaskCreateRequest(BaseModel):
+    title: str = Field(min_length=1)
+    description: str | None = None
+    due_date: str | None = None
+    assigned_to_user_id: str | None = None
+    priority: Literal[TASK_PRIORITIES] = "medium"
+
+
+@router.post("/{deal_id}/tasks", status_code=status.HTTP_201_CREATED)
+def create_deal_task(
+    deal_id: str, payload: DealTaskCreateRequest,
+    user: CurrentUser = Depends(require_role("admin", "analyst")),
+) -> dict:
+    with db_session(claims_for(user)) as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("select deal_id, property_address from deals where deal_id = %s", (deal_id,))
+            deal = cur.fetchone()
+        if deal is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Deal not found")
+
+        with conn.transaction():
+            row = conn.execute(
+                """
+                insert into deal_tasks (deal_id, org_id, title, description, due_date,
+                                         assigned_to_user_id, priority, source_agent)
+                values (%s, %s, %s, %s, %s, %s, %s, null)
+                returning task_id
+                """,
+                (deal_id, user.org_id, payload.title, payload.description, payload.due_date,
+                 payload.assigned_to_user_id, payload.priority),
+            ).fetchone()
+            task_id = str(row[0])
+
+            # Section 73: "Assigned users receive notification on task creation." Manually
+            # created tasks may be left unassigned (assigned_to_user_id is nullable), in
+            # which case there's no one to notify yet.
+            if payload.assigned_to_user_id is not None:
+                spec = task_assigned_notification(
+                    title=payload.title, property_address=deal["property_address"], source_agent=None,
+                )
+                InAppChannel().send(
+                    conn, org_id=user.org_id, spec=spec, deal_id=deal_id,
+                    recipient_user_id=payload.assigned_to_user_id,
+                )
+
+    return {"task_id": task_id, "deal_id": deal_id, "status": "not_started"}
+
+
+@router.get("/{deal_id}/tasks")
+def list_deal_tasks(
+    deal_id: str, user: CurrentUser = Depends(require_role("admin", "analyst", "viewer")),
+) -> list[dict]:
+    with db_session(claims_for(user)) as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("select deal_id from deals where deal_id = %s", (deal_id,))
+            if cur.fetchone() is None:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Deal not found")
+            cur.execute(
+                "select * from deal_tasks where deal_id = %s order by created_at desc", (deal_id,),
+            )
+            return cur.fetchall()
